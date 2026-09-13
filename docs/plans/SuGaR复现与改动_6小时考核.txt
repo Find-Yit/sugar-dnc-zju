@@ -285,9 +285,6 @@ R7 PBS walltime 不足 → 用户在登录节点续作业；所有中间产物�
 ✅ 阶段 2：基线 B1–B5 PASS（06:11 完成，三步墙钟 2m13s + 12m44s + 6m22s）；Fable 独立核对 3DGS test PSNR 23.9087、mesh V=205,647 F=370,438
    勘误：-d 200000 实际是 fg/bg 各 20 万三角形的目标（非顶点），合并后 ≈37 万面属正常；三组统一沿用即可。
    baseline 碎片分量（<100 面）= 2,147，连通分量 2,237，作为 H1 参照值。
-🔶 阶段 3：C1 diff 审阅通过、C2 Fable 盲验通过（5 个随机平面 loss≈1e-8、错误法向 loss 与解析值一致到 1e-5）；S3.4 三组正式 run 06:35 启动（执行者 4）
-   决策记录：阶段 2 未打补丁的 baseline 保留为留档；正式对照三组统一用打补丁代码 + seed 0（coarse_base_seed0 / coarse_dnc005 / coarse_dnc02），未打补丁 baseline 与 λ=0 的指标对比可额外证明 λ=0 代码路径未变。
-   执行者 2 新增掩码条件 ‖N_raw‖>0.1（合成后低不透明度像素保护）：Fable 接受，记入报告。
-🔶 阶段 4：评测脚本就绪（执行者 3，07:00）；E1 Fable 独立复算 baseline PASS：4 视角 PSNR 从 PNG 重算差 ≤0.003 dB；G1 median 0.004003 / 分量 2237 / 碎片 2147 与我自写 open3d 脚本逐位一致。三组指标与图待 run 完成
-   执行者 3 备注：cameras.json 内参为 COLMAP 原分辨率，SuGaR 包装器换算后 3DGS 7k PSNR 23.9003 vs 官方日志 23.9087（差 0.008 dB，报告注明）；G3 用前景顶点版本。
-🔶 阶段 5：骨架（图表脚本、报告生成脚本、仓库脚手架）执行者 5 于 07:05 启动
+✅ 阶段 3：C1–C4 通过。六组训练侧对照（baseline留档 / λ=0 / 0.05 / 0.2 / 0.2+detach / 官方dn_consistency）+ 六组提取端扫参（pdauto/pd9/pd8/q0/q005/pdauto_q0）全部完成并评测；H1/H2 不支持，H4（detach 消除平凡解）支持；官方 dn_consistency 有效（碎片 −16%，PSNR −0.24 dB）
+✅ 阶段 4：E1 Fable 对 baseline / λ 组 / 官方组 / 提取端组独立复算全部一致；E2 summary.csv 13 行齐全；E3 图已看
+✅ 阶段 5：report.pdf 27 页（outputs/reports/report.pdf，validate 通过，中文 43%，替代字符 0，占位符 0）；GitHub https://github.com/Find-Yit/sugar-dnc-zju 分支 dnc，commit 772c0c9（09:50）。剩余：Fable 逐页人眼终审仅抽查了封面与 P13 页；作业到期前保存点见 notes/STATE_SNAPSHOT_0946.md

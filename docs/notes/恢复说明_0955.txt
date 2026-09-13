@@ -1,0 +1,23 @@
+恢复说明（2026-09-13 09:55，GPU 作业到期前保存）
+
+一、当前状态
+- 所有产物在 /scratch/e1351071/zju_test，已推 GitHub https://github.com/Find-Yit/sugar-dnc-zju 分支 dnc，commit 772c0c9（终稿 v1）。
+- outputs/reports/report.pdf：27 页，自动验收通过（中文 43%，替代字符 0），P1–P13 分析全部写入。
+- 唯一遗留：第 17 页有一行红字"图 7 尚未生成"，原因是我重跑 make_figures.py 时漏了 --sweep_runs 参数，
+  fig7 的 PNG 其实已存在（outputs/figures/fig7_提取端扫参.png），只需按下面命令重跑一次即可消除。
+- 聊天记录：logs/session_backup_*.jsonl（主会话）、logs/subagent_transcripts_*/（子代理）。
+- 状态快照：notes/STATE_SNAPSHOT_0946.md；计划 checklist 已更新到最终状态：plans/SuGaR复现与改动_6小时考核.txt。
+- 给另一台 4×A100 机器的方案：plans/新方案_A100四卡_SuGaR改进.md（v2.1），调研：notes/SURVEY_sugar_improvements.md、notes/SURVEY2_sugar_direct_followups.md。
+
+二、恢复后要做的（不需要 GPU，约 10 分钟，只用 CPU + tools/doc_env）
+cd /scratch/e1351071/zju_test && export LC_ALL=C.UTF-8 && P=tools/doc_env/bin/python
+$P scripts/deliverables/make_figures.py --sweep_runs base_seed0 base_seed0_pdauto base_seed0_pd9 base_seed0_pd8 base_seed0_q0 base_seed0_q005 base_seed0_pdauto_q0
+$P scripts/deliverables/make_report.py --out outputs/reports/report.docx --labels "基线 λ=0" "本工作 λ=0.05" "本工作 λ=0.2" "λ=0.2+detach" "官方 DNC"
+scripts/deliverables/libreoffice.sh --headless --convert-to pdf --outdir outputs/reports outputs/reports/report.docx
+$P .agents/skills/scientific-deliverables/scripts/validate_artifacts.py outputs/reports/report.docx outputs/reports/report.pdf --preview-root outputs/previews --report notes/doc_toolchain/SELF_CHECK_report_final.md --font assets/fonts/NotoSansCJKsc-Regular.otf
+# 然后逐页看 outputs/previews/report/全部页面联系表.png，确认无"尚未生成"红字
+cp outputs/reports/report.pdf repo/SuGaR/report.pdf && cp outputs/figures/fig*.png repo/SuGaR/results/figures/ && cd repo/SuGaR && git add -A && git commit -m "终稿 v2：补齐图 7" && git push github dnc
+
+三、交付物
+- report.pdf：outputs/reports/report.pdf（仓库根目录也有一份）
+- GitHub：https://github.com/Find-Yit/sugar-dnc-zju（分支 dnc，clone 时加 --recursive）

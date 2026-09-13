@@ -3,7 +3,7 @@
 ====================================================================
 制定：Claude Fable 5.1（计划 + 验收）      执行：opus-executor（claude-opus-5，effort max）
 创建：2026-09-13 05:40（考核开始约 05:20，硬截止约 11:20）
-状态：v1.2，2026-09-13 06:05 用户批准：阶段 1+2、改动方案 A（DNC，引用 2DGS）、评测方案（§2b）；GitHub 仓库 https://github.com/Find-Yit/sugar-dnc-zju.git；允许多执行者并行
+状态：v1.3 终态（10:05 交付完成）；v1.2，2026-09-13 06:05 用户批准：阶段 1+2、改动方案 A（DNC，引用 2DGS）、评测方案（§2b）；GitHub 仓库 https://github.com/Find-Yit/sugar-dnc-zju.git；允许多执行者并行
 
 --------------------------------------------------------------------
 TL;DR
@@ -287,4 +287,5 @@ R7 PBS walltime 不足 → 用户在登录节点续作业；所有中间产物�
    baseline 碎片分量（<100 面）= 2,147，连通分量 2,237，作为 H1 参照值。
 ✅ 阶段 3：C1–C4 通过。六组训练侧对照（baseline留档 / λ=0 / 0.05 / 0.2 / 0.2+detach / 官方dn_consistency）+ 六组提取端扫参（pdauto/pd9/pd8/q0/q005/pdauto_q0）全部完成并评测；H1/H2 不支持，H4（detach 消除平凡解）支持；官方 dn_consistency 有效（碎片 −16%，PSNR −0.24 dB）
 ✅ 阶段 4：E1 Fable 对 baseline / λ 组 / 官方组 / 提取端组独立复算全部一致；E2 summary.csv 13 行齐全；E3 图已看
-✅ 阶段 5：report.pdf 27 页（outputs/reports/report.pdf，validate 通过，中文 43%，替代字符 0，占位符 0）；GitHub https://github.com/Find-Yit/sugar-dnc-zju 分支 dnc，commit 772c0c9（09:50）。剩余：Fable 逐页人眼终审仅抽查了封面与 P13 页；作业到期前保存点见 notes/STATE_SNAPSHOT_0946.md
+✅ 阶段 5（终态 10:05）：report.pdf 27 页（outputs/reports/report.pdf 与仓库根目录），validate 通过（中文 43%，替代字符 0，占位符 0，图 7 已补）；Fable 人眼抽查封面/摘要/主结果表/图 7 页，主表 ≥10 个数字与 summary.csv 一致；GitHub https://github.com/Find-Yit/sugar-dnc-zju 分支 dnc，commit 9d7913b。
+   已知小瑕疵：摘要首段（脚本模板）仍写"三组对照"，第二段与正文为五组+提取端，未再改。

@@ -73,17 +73,26 @@ RUN_COLOR_KEYS = {
     "coarse_baseline": "navy",
     "coarse_dnc005": "teal",
     "coarse_dnc02": "orange",
+    "coarse_dnc02_detach": "red",
+    "coarse_official_dnc": "navy",
     "vanilla3dgs7k": "muted",
 }
 FALLBACK_COLOR_KEYS = ["blue", "teal", "orange", "navy", "red", "muted"]
 
-DEFAULT_RUNS = ["coarse_base_seed0", "coarse_dnc005", "coarse_dnc02"]
+DEFAULT_RUNS = ["coarse_base_seed0", "coarse_dnc005", "coarse_dnc02",
+                "coarse_dnc02_detach", "coarse_official_dnc"]
 DEFAULT_LABELS = {
     "coarse_base_seed0": "基线(λ=0)",
-    "coarse_dnc005": "DNC λ=0.05",
-    "coarse_dnc02": "DNC λ=0.2",
+    "coarse_dnc005": "本工作 λ=0.05",
+    "coarse_dnc02": "本工作 λ=0.2",
+    "coarse_dnc02_detach": "λ=0.2 + detach",
+    "coarse_official_dnc": "官方 dn_consistency",
     "coarse_baseline": "基线(阶段2 留档)",
     "vanilla3dgs7k": "3DGS 7k(参考)",
+    "base_seed0_pdauto": "自动深度",
+    "base_seed0_q0": "quantile=0",
+    "base_seed0_pdauto_q0": "自动深度+quantile=0",
+    "base_seed0_pd8": "D=8",
 }
 
 # --------------------------------------------------------------------------- 通用小工具

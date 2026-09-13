@@ -1,0 +1,11 @@
+{
+  "source_coarse": "coarse_base_seed0",
+  "note": "仅 mesh 提取端消融：coarse 模型与 coarse_base_seed0 完全相同，只改 Poisson 参数；渲染指标 / 训练代价由 summarize.py 从该 run 继承。",
+  "extract_stats": {
+    "poisson_depth_arg": "auto",
+    "poisson_depth_used": 10,
+    "vertices_density_quantile": 0.0,
+    "cell_size_nn_distance_ratio": 100.0,
+    "extraction_wall_clock_s": 304.1155631542206
+  }
+}

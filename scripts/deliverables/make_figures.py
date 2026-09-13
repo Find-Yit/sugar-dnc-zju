@@ -32,8 +32,8 @@ from PIL import Image                               # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _deliv_common import (                         # noqa: E402
-    COLORS, DEFAULT_LABELS, DEFAULT_RUNS, FIGURE_DIR, RunData, build_runs,
-    configure_matplotlib, dig, hexc, rel, save_figure, to_float,
+    COLORS, DEFAULT_LABELS, DEFAULT_RUNS, FALLBACK_COLOR_KEYS, FIGURE_DIR, METRICS_DIR,
+    RunData, build_runs, configure_matplotlib, dig, hexc, load_json, rel, save_figure, to_float,
 )
 
 plt = configure_matplotlib()
@@ -196,7 +196,12 @@ def _bar_panel(ax, runs, values, title, unit, better, nd):
                 fontsize=7.6, color=hexc("red"), transform=ax.transAxes)
     ax.set_xlim(-0.65, len(runs) - 0.35)
     ax.set_xticks(xs)
-    ax.set_xticklabels([r.label for r in runs], fontsize=9)
+    n = len(runs)
+    fs = 9 if n <= 3 else (8 if n <= 5 else 7)
+    rot = 0 if n <= 3 else (12 if n <= 5 else 20)
+    ax.set_xticklabels([r.label.replace("(", "\n(") if n > 4 else r.label for r in runs],
+                       fontsize=fs, rotation=rot,
+                       ha="center" if rot == 0 else "right")
     ax.grid(axis="y", color=LINE, linewidth=0.8)
     ax.set_axisbelow(True)
     ax.spines[["top", "right"]].set_visible(False)
@@ -204,7 +209,7 @@ def _bar_panel(ax, runs, values, title, unit, better, nd):
 
 
 def fig1_metrics(runs, args) -> dict:
-    fig = plt.figure(figsize=(15.4, 8.6))
+    fig = plt.figure(figsize=(max(15.4, 2.6 * len(runs) + 6.0), 9.0))
     gs = GridSpec(2, 12, figure=fig, hspace=0.58, wspace=0.85,
                   left=0.055, right=0.985, top=0.845, bottom=0.13)
     for j, (col, getter, title, unit, better, nd) in enumerate(PANELS_RENDER):
@@ -684,6 +689,73 @@ def fig6_failure_crops(runs, args) -> dict | None:
     return {"fig": fig, "stem": "fig6_失败案例特写"}
 
 
+def _poisson_params(run: RunData) -> tuple[str, str]:
+    """从 provenance_<run>.json 读 Poisson 深度与密度分位；读不到就用 SuGaR 默认值。"""
+    prov = load_json(METRICS_DIR / f"provenance_{run.key}.json") or {}
+    st = prov.get("extract_stats") or {}
+    d_arg = st.get("poisson_depth_arg")
+    d_used = st.get("poisson_depth_used")
+    q = st.get("vertices_density_quantile")
+    if d_arg is None and d_used is None:
+        d = "10（默认）"
+    elif str(d_arg) == "auto":
+        d = f"auto→{d_used}"
+    else:
+        d = str(d_used if d_used is not None else d_arg)
+    qs = "0.1（默认）" if q is None else f"{float(q):g}"
+    return d, qs
+
+
+FIG7_PANELS = [
+    ("G4_n_fragments_lt100faces_down", _v_frag,
+     "漂浮碎片分量数（< 100 面）", "分量个数", "down", 0),
+    ("G1_median_rel_pct_down", _v_geom("G1_sparse_to_mesh_distance", "median_rel", 100.0),
+     "G1 稀疏点→网格距离 中位数", "% 相机空间尺度", "down", 4),
+    ("G5_dihedral_abs_deg_mean_down", _v_geom("G5_normal_smoothness", "dihedral_abs_deg_mean"),
+     "G5 相邻面二面角绝对值均值", "度", "down", 2),
+    ("G4_largest_comp_face_ratio_pct_up",
+     _v_geom("G4_topology", "largest_component_face_ratio", 100.0),
+     "最大连通分量面数占比", "%", "up", 2),
+]
+
+
+def fig7_poisson_sweep(runs, args) -> dict | None:
+    """提取端扫参：同一个 coarse 模型，只改 Poisson 深度 D 与密度分位 quantile。"""
+    keys = args.sweep_runs or []
+    if not keys:
+        return {"skip": "未指定 --sweep_runs，跳过 fig7（提取端扫参图）"}
+    sweep = build_runs(keys, [args.sweep_labels[i] if args.sweep_labels and
+                              i < len(args.sweep_labels) else k
+                              for i, k in enumerate(keys)])
+    sweep = [r for r in sweep if r.geometry]
+    if not sweep:
+        return {"skip": "--sweep_runs 里没有一个 run 有 geometry_*.json，跳过 fig7"}
+    for i, r in enumerate(sweep):          # 用 D / quantile 当显示名，柱子颜色按顺序取
+        d, q = _poisson_params(r)
+        r.label = f"{r.label}\nD={d}\nq={q}"
+        r.color = hexc(FALLBACK_COLOR_KEYS[i % len(FALLBACK_COLOR_KEYS)])
+
+    fig = plt.figure(figsize=(max(13.5, 2.9 * len(sweep) + 4.0), 9.4))
+    gs = GridSpec(2, 2, figure=fig, hspace=0.62, wspace=0.24,
+                  left=0.075, right=0.98, top=0.83, bottom=0.115)
+    for k, (col, getter, title, unit, better, nd) in enumerate(FIG7_PANELS):
+        ax = fig.add_subplot(gs[k // 2, k % 2])
+        _bar_panel(ax, sweep, _panel_values(sweep, col, getter), title, unit, better, nd)
+
+    fig.suptitle("提取端扫参：Poisson 深度 D 与顶点密度分位 quantile 对网格的影响",
+                 fontsize=14.5, fontweight="bold", color=NAVY, y=0.982)
+    fig.text(0.5, 0.925,
+             "所有组共用同一个 coarse SuGaR 模型（λ=0，15000 迭代），只改网格提取参数，"
+             "因此渲染指标完全相同，差异全部来自提取端；Δ 为相对第一组（原版参数）的变化",
+             ha="center", va="top", fontsize=9.5, color=MUTED)
+    _footnote(fig,
+              "数据来源：outputs/metrics/summary.csv 与 geometry_<run>.json；D 与 quantile 取自 "
+              "outputs/metrics/provenance_<run>.json（没有该文件的组用 SuGaR 默认值 D=10、quantile=0.1）。"
+              "auto 深度的计算方式移植自 Anttwo/Frosting 的 frosting_extractors/coarse_shell.py 第 17–49 行。",
+              y=0.048)
+    return {"fig": fig, "stem": "fig7_提取端扫参"}
+
+
 # =========================================================================== main
 
 BUILDERS = {
@@ -694,6 +766,7 @@ BUILDERS = {
     "fig5": fig5_dnc_intermediate,
     "fig5b": fig5b_dnc_lambda_compare,
     "fig6": fig6_failure_crops,
+    "fig7": fig7_poisson_sweep,
 }
 
 
@@ -715,6 +788,10 @@ def main():
     p.add_argument("--crop", action="append", default=None,
                    metavar="run,view,x0,y0,x1,y1[,说明]",
                    help="fig6 的裁剪区域，可重复；run 可写 ALL 表示所有 run 各出一行")
+    p.add_argument("--sweep_runs", nargs="+", default=None,
+                   help="fig7 用的提取端扫参 run 列表（同一 coarse 模型、不同 Poisson 参数）")
+    p.add_argument("--sweep_labels", nargs="+", default=None,
+                   help="与 --sweep_runs 一一对应的中文显示名")
     p.add_argument("--manifest", type=Path, default=None,
                    help="生成状态 JSON，默认 <outdir>/figures_manifest.json")
     args = p.parse_args()

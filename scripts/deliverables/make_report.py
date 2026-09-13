@@ -46,8 +46,9 @@ from PIL import Image                               # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _deliv_common import (                         # noqa: E402
     COLORS, DEFAULT_LABELS, DEFAULT_RUNS, FIGURE_DIR, FONT_SANS_NAME, FONT_SERIF_NAME,
-    METRICS_DIR, NOTES_DIR, PROJ_ROOT, REPORT_DIR, RunData, SUMMARY_CSV, build_runs,
-    configure_matplotlib, dig, fmt_num, load_json, read_text, rel, to_float,
+    METRICS_DIR, NOTES_DIR, PROJ_ROOT, REPORT_DIR, RunData, SUMMARY_CSV, build_run,
+    build_runs, configure_matplotlib, dig, fmt_num, load_json, load_summary, read_text,
+    rel, to_float,
 )
 
 PLACEHOLDERS: list[str] = []          # 收集所有"待 Fable 填写"的分析性文字
@@ -59,12 +60,15 @@ TABLE_SEQ: list[str] = []             # 表编号顺序
 # 即使对应的图还没生成、表还没有数据，也会插入一个"未生成/未完成"的占位框，
 # 这样交叉引用（"见表 5"）永远不会错位。
 FIG_FORMULA, FIG_METRICS, FIG_RENDER, FIG_NORMAL = 1, 2, 3, 4
-FIG_CURVE, FIG_DNC, FIG_DNC_CMP, FIG_FAIL = 5, 6, 7, 8
+FIG_CURVE, FIG_DNC, FIG_SWEEP, FIG_FAIL = 5, 6, 7, 8
 N_FIGURES = 8
 TAB_ENV, TAB_DATA, TAB_PATCH, TAB_CFG, TAB_KILLED = 1, 2, 3, 4, 5
-TAB_RENDER, TAB_GEOM, TAB_TOPO, TAB_SMOOTH = 6, 7, 8, 9
-TAB_COST, TAB_ARTIFACT, TAB_METRICDEF = 10, 11, 12
-N_TABLES = 12
+TAB_RENDER, TAB_GEOM, TAB_TOPO, TAB_SMOOTH, TAB_COST = 6, 7, 8, 9, 10
+TAB_OFFICIAL, TAB_SWEEP, TAB_LEGACY, TAB_ARTIFACT, TAB_METRICDEF = 11, 12, 13, 14, 15
+N_TABLES = 15
+
+# Fable 写好的分析段落（P1–P13），按占位符编号原文插入，不改写、不润色
+ANALYSIS_MD = NOTES_DIR / "REPORT_ANALYSIS_fable.md"
 
 REFERENCES = [
     "[1] Guédon A., Lepetit V. SuGaR: Surface-Aligned Gaussian Splatting for Efficient 3D Mesh "
@@ -187,6 +191,64 @@ def missing_note(doc, text, size=10):
     return p
 
 
+def load_analysis(path: Path = None) -> dict[str, str]:
+    """读 Fable 的分析文件，切成 {'P1': 正文, 'P2': ...}。原文插入，不做任何改写。"""
+    path = path or ANALYSIS_MD
+    txt = read_text(path)
+    if not txt:
+        return {}
+    out: dict[str, str] = {}
+    cur, buf = None, []
+    for line in txt.splitlines():
+        m = re.match(r"^##\s+(P\d+)\b(.*)$", line.strip())
+        if m:
+            if cur:
+                out[cur] = "\n".join(buf).strip()
+            cur, buf = m.group(1), []
+        elif cur is not None:
+            buf.append(line)
+    if cur:
+        out[cur] = "\n".join(buf).strip()
+    return {k: v for k, v in out.items() if v}
+
+
+def _split_bold(text: str):
+    """把 **加粗** 切成 (片段, 是否加粗) 序列；反引号直接去掉。"""
+    text = text.replace("`", "")
+    parts = re.split(r"\*\*(.+?)\*\*", text)
+    for i, seg in enumerate(parts):
+        if seg:
+            yield seg, (i % 2 == 1)
+
+
+def rich_para(doc, text, style=None, size=10.5):
+    p = doc.add_paragraph(style=style)
+    p.paragraph_format.space_after = DocxPt(5)
+    for seg, bold in _split_bold(text):
+        set_run_font(p.add_run(seg), FONT_SERIF_NAME, size, bold=bold or None)
+    return p
+
+
+def analysis(doc, key: str, desc: str, texts: dict[str, str]):
+    """有 Fable 的正文就原文插入；没有就退回橙色占位符。"""
+    body = texts.get(key)
+    if not body:
+        return placeholder(doc, f"{key}｜{desc}")
+    for raw in body.split("\n"):
+        line = raw.rstrip()
+        if not line.strip():
+            continue
+        m = re.match(r"^\s*[-*]\s+(.*)$", line)
+        num = re.match(r"^\s*(\d+)\.\s+(.*)$", line)
+        if m:
+            rich_para(doc, m.group(1), style="List Bullet")
+        elif num:
+            rich_para(doc, f"{num.group(1)}. {num.group(2)}")
+        else:
+            rich_para(doc, line)
+    return None
+
+
 def code_block(doc, text, size=8.0):
     """命令 / 日志片段：浅灰底单元格，等宽感的小字号。"""
     table = doc.add_table(rows=1, cols=1)
@@ -251,6 +313,7 @@ def add_table(doc, headers, rows, cap_text, font_size=8.4, head_size=8.4,
     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
     p.paragraph_format.space_before = DocxPt(8)
     p.paragraph_format.space_after = DocxPt(4)
+    p.paragraph_format.keep_with_next = True      # 表题必须和表格待在同一页
     set_run_font(p.add_run(f"表 {idx}  {cap_text}"), FONT_SANS_NAME, 9.5,
                  bold=True, color=COLORS["navy"])
 
@@ -529,11 +592,89 @@ def smooth_rows(runs, refs):
     return rows
 
 
+SWEEP_RUNS = ["coarse_base_seed0", "base_seed0_pdauto", "base_seed0_q0",
+              "base_seed0_pdauto_q0", "base_seed0_pd8"]
+SWEEP_LABELS = {
+    "coarse_base_seed0": "原版参数（对照基准）",
+    "base_seed0_pdauto": "自动 Poisson 深度",
+    "base_seed0_q0": "quantile=0",
+    "base_seed0_pdauto_q0": "自动深度 + quantile=0",
+    "base_seed0_pd8": "Poisson 深度 D=8",
+}
+
+
+def poisson_params(run: RunData) -> tuple[str, str]:
+    """从 provenance_<run>.json 读实际用到的 Poisson 深度与密度分位；没有就是 SuGaR 默认值。"""
+    prov = load_json(METRICS_DIR / f"provenance_{run.key}.json") or {}
+    st = prov.get("extract_stats") or {}
+    d_arg, d_used, q = st.get("poisson_depth_arg"), st.get("poisson_depth_used"), st.get("vertices_density_quantile")
+    if d_arg is None and d_used is None:
+        d = "10（默认）"
+    elif str(d_arg) == "auto":
+        d = f"auto→{d_used}"
+    else:
+        d = str(d_used if d_used is not None else d_arg)
+    return d, ("0.1（默认）" if q is None else f"{float(q):g}")
+
+
+def _pct_delta(v, base, nd=1):
+    """相对基准的百分比变化；基准为 0 或缺失时返回 '—'。"""
+    if v is None or base in (None, 0):
+        return "—"
+    return f"{(v - base) / base * 100:+.{nd}f}%"
+
+
+def sweep_rows(summary) -> list[list[str]]:
+    rows = []
+    base = None
+    for key in SWEEP_RUNS:
+        r = build_run(key, SWEEP_LABELS.get(key, key), summary=summary)
+        if not r.geometry:
+            continue
+        d, q = poisson_params(r)
+        t = dig(r.geometry, "G4_topology", default={}) or {}
+        frag = next((v for k, v in t.items() if k.startswith("n_fragment_components_lt_")), None)
+        vals = {
+            "nv": to_float(t.get("n_vertices")),
+            "nf": to_float(t.get("n_faces")),
+            "g1": (x * 100 if (x := to_float(dig(r.geometry, "G1_sparse_to_mesh_distance", "median_rel"))) is not None else None),
+            "g2": (x * 100 if (x := to_float(dig(r.geometry, "G2_precision_ratio", "ratio_below_1pct"))) is not None else None),
+            "comp": to_float(t.get("n_connected_components")),
+            "frag": to_float(frag),
+            "maxc": (x * 100 if (x := to_float(t.get("largest_component_face_ratio"))) is not None else None),
+            "g5": to_float(dig(r.geometry, "G5_normal_smoothness", "dihedral_abs_deg_mean")),
+        }
+        if base is None:
+            base = vals
+            rows.append([r.label, d, q,
+                         f"{int(vals['nv']):,}" if vals["nv"] else "未完成",
+                         f"{int(vals['nf']):,}" if vals["nf"] else "未完成",
+                         fmt_num(vals["g1"], 4), fmt_num(vals["g2"], 3),
+                         f"{int(vals['comp']):,}" if vals["comp"] else "未完成",
+                         f"{int(vals['frag']):,}" if vals["frag"] else "未完成",
+                         fmt_num(vals["maxc"], 2), fmt_num(vals["g5"], 2)])
+        else:
+            rows.append([
+                r.label, d, q,
+                f"{int(vals['nv']):,}（{_pct_delta(vals['nv'], base['nv'])}）" if vals["nv"] else "未完成",
+                f"{int(vals['nf']):,}（{_pct_delta(vals['nf'], base['nf'])}）" if vals["nf"] else "未完成",
+                f"{fmt_num(vals['g1'], 4)}（{_pct_delta(vals['g1'], base['g1'])}）",
+                f"{fmt_num(vals['g2'], 3)}（{_pct_delta(vals['g2'], base['g2'], 2)}）",
+                f"{int(vals['comp']):,}（{_pct_delta(vals['comp'], base['comp'])}）" if vals["comp"] else "未完成",
+                f"{int(vals['frag']):,}（{_pct_delta(vals['frag'], base['frag'])}）" if vals["frag"] else "未完成",
+                f"{fmt_num(vals['maxc'], 2)}（{_pct_delta(vals['maxc'], base['maxc'])}）",
+                f"{fmt_num(vals['g5'], 2)}（{_pct_delta(vals['g5'], base['g5'])}）",
+            ])
+    return rows
+
+
 def cost_rows(runs, refs):
     rows = []
     for r, is_ref in [(x, False) for x in runs] + [(x, True) for x in refs]:
         st = train_stats(r)
         lam = r.dnc_factor
+        if lam is None:      # 官方 dn_consistency 训练器把权重写成 dn_consistency_factor
+            lam = to_float(st.get("dn_consistency_factor"))
         if not st and not r.summary:
             continue
         wall = r.s("train_wall_clock_min")
@@ -569,6 +710,9 @@ def build(doc, runs, refs, figs, args):
     runlog_s34 = read_text(NOTES_DIR / "RUNLOG_s34.md")
     runlog_eval = read_text(NOTES_DIR / "RUNLOG_eval.md")
     patch_text = read_text(NOTES_DIR / "dnc_stage3.patch")
+    A = load_analysis()          # Fable 的 P1–P13 正文
+    summary_all = load_summary()
+    legacy = build_run("coarse_baseline", DEFAULT_LABELS["coarse_baseline"], summary=summary_all)
 
     # ---------------------------------------------------------------- 封面
     t = doc.add_paragraph(style="Title")
@@ -583,8 +727,11 @@ def build(doc, runs, refs, figs, args):
     info = [
         ("目标开源项目", "SuGaR（CVPR 2024），官方 commit 7c10c4a"),
         ("数据集与场景", "Tanks & Temples / Truck（3DGS 官方打包 tandt_db.zip，含 COLMAP 稀疏重建）"),
-        ("改动点", "在 coarse SuGaR 训练主循环中加入深度-法向一致性正则 L_DNC（借鉴 2DGS 思路，自行实现）"),
-        ("对照组", "λ = 0 / 0.05 / 0.2 三组完整重跑（训练 + 网格提取 + 评测）"),
+        ("改动点", "① 训练端：在 coarse SuGaR 训练主循环中加入深度-法向一致性正则 L_DNC"
+                   "（借鉴 2DGS 思路，自行实现）；② 提取端：把泊松重建深度改为按场景尺度自动推算"
+                   "（移植自 Frosting）"),
+        ("对照组", "训练端五组完整重跑：λ=0 / 0.05 / 0.2 / 0.2+detach 诊断 / 官方 dn_consistency；"
+                   "提取端在同一个 λ=0 模型上扫 Poisson 深度与顶点密度分位"),
         ("报告生成时间", now),
     ]
     for label, value in info:
@@ -624,8 +771,7 @@ def build(doc, runs, refs, figs, args):
          "并针对法向符号歧义、低不透明度像素与物体边缘设计了掩码。"
          "实验在 Tanks & Temples 的 Truck 场景上以 λ ∈ {0, 0.05, 0.2} 做三组完整对照，"
          "统一评测渲染质量（PSNR / SSIM / LPIPS）与网格几何（稀疏点到网格距离、拓扑碎片、法向平滑度）。")
-    placeholder(doc, f"摘要的结论句：一句话概括三组对照的主要发现（DNC 对几何指标的影响方向与幅度、"
-                     f"渲染指标的代价、λ 的敏感性），必须与表 {TAB_RENDER}–表 {TAB_COST} 的数字一致")
+    analysis(doc, "P1", "摘要结论句", A)
 
     doc.add_heading("预注册的可检验假设", level=2)
     for h, desc in [
@@ -637,9 +783,7 @@ def build(doc, runs, refs, figs, args):
         p.paragraph_format.space_after = DocxPt(4)
         set_run_font(p.add_run(f"{h}："), FONT_SANS_NAME, 10.5, bold=True, color=COLORS["navy"])
         set_run_font(p.add_run(desc), FONT_SERIF_NAME, 10.5)
-    placeholder(doc, f"逐条给出 H1 / H2 / H3 的结论（支持 / 不支持 / 不确定）及其依据数字："
-                     f"H1 看表 {TAB_GEOM} 与表 {TAB_TOPO}，H2 看表 {TAB_RENDER}，"
-                     f"H3 看图 {FIG_CURVE} 的 (a)(b) 两幅曲线")
+    analysis(doc, "P2", "H1/H2/H3 判定", A)
 
     # ---------------------------------------------------------------- 1 环境与数据
     doc.add_heading("1 环境与数据", level=1)
@@ -717,6 +861,10 @@ def build(doc, runs, refs, figs, args):
 
     # ---------------------------------------------------------------- 3 改动
     doc.add_heading("3 改动动机与实现", level=1)
+    para(doc,
+         "本工作一共做了两处进入主流程的改动：训练端的深度-法向一致性正则（本章，是主要改动），"
+         "以及提取端的自动泊松深度（移植自 Frosting，见 5.4 节）。两者互不依赖，可以单独开关。",
+         size=10)
     doc.add_heading("3.1 动机", level=2)
     para(doc,
          "SuGaR 用 SDF / density 正则把高斯压扁并贴到表面上，但每个高斯的法向只受到采样点级别的 SDF 约束，"
@@ -759,14 +907,16 @@ def build(doc, runs, refs, figs, args):
     # ---------------------------------------------------------------- 4 实验设置
     doc.add_heading("4 实验设置与对照", level=1)
     cfg_rows = []
-    for r in runs + refs:
+    for r in runs + refs + [legacy]:
         st = train_stats(r)
         lam = r.dnc_factor
+        if lam is None:
+            lam = to_float(st.get("dn_consistency_factor"))
         cfg_rows.append([
             r.label,
             r.key,
             f"{lam:g}" if lam is not None else "—",
-            str(st.get("dnc_start", "9000") if st else "9000") if (lam or 0) > 0 else "—",
+            str(st.get("dnc_start") or st.get("start") or 9000) if (lam or 0) > 0 else "—",
             rel(r.run_dir) if r.run_dir else "未完成",
         ])
     add_table(doc, ["组别", "run 目录名", "λ (--dnc_factor)", "DNC 起始迭代", "输出目录"],
@@ -779,8 +929,7 @@ def build(doc, runs, refs, figs, args):
               "该结果仅作为“补丁未改变 λ=0 代码路径”的旁证留档，不参与三组正式对照；"
               "正式对照的三组统一使用打补丁后的代码与 seed=0。",
          size=10)
-    placeholder(doc, "对比 coarse_baseline（未打补丁）与 λ=0 组的指标差异，说明差异是否只在 "
-                     "CUDA 非确定性的量级内，以此证明 λ=0 时代码路径未被改变")
+    analysis(doc, "P3", "未打补丁 baseline 与 λ=0 的差异", A)
 
     doc.add_heading("4.1 过程记录：首轮 λ 组被中断与重跑", level=2)
     killed = scan_interrupted_runs(PROJ_ROOT / "outputs" / "runs")
@@ -811,21 +960,28 @@ def build(doc, runs, refs, figs, args):
               note="表中数字由脚本直接从磁盘上的残留文件统计得到（dnc_log.csv 的最大迭代号、"
                    "dnc_vis/ 下 iter*_depth.png 的数量与最大迭代号），不是人工记录。"
                    "这些目录只用于说明中断发生的时点，其指标不进入任何结论。")
-    placeholder(doc, "过程记录的补充说明：首轮中断的具体时刻、作业与节点变化（双卡→单卡）、"
-                     "重跑的起止时间，以及“单卡顺序执行”对墙钟时间对比的影响（见训练代价表）")
+    analysis(doc, "P4", "过程记录补充", A)
+    para(doc,
+         "写作后期追加的两组实验的时间线（逐字取自各阶段 SELF_CHECK 的日志表）："
+         "① 官方 dn_consistency 对照组 —— 等待脚本 08:34:34 进入 GPU 轮询，"
+         "08:58:55 检测到 detach 组结束信号后开始训练，09:13:35 训练结束（880 秒），"
+         "09:18:52 网格提取结束（317 秒），09:19:39 评测完成；"
+         "② 提取端扫参（Frosting 自动 Poisson 深度）—— 09:16 完成移植与自检，"
+         "四组提取与评测在 09:2x–10:0x 顺序完成，全部复用同一个 λ=0 的 coarse 模型，不重训。",
+         size=10)
 
     # ---------------------------------------------------------------- 5 结果
     doc.add_heading("5 结果", level=1)
     doc.add_heading("5.1 定量结果", level=2)
     add_table(doc, ["组别", "高斯数", "PSNR (dB) ↑", "PSNR 标准差", "SSIM ↑", "LPIPS-VGG ↓", "测试视角数"],
               render_rows(runs, refs), "测试视角上的渲染质量指标",
-              font_size=8.6, col_widths=[3.4, 2.4, 2.2, 2.0, 2.0, 2.2, 1.8],
+              font_size=8.6, col_widths=[3.1, 2.3, 2.2, 2.0, 2.0, 2.2, 2.0],
               note="↑ 越高越好，↓ 越低越好。PSNR 标准差为 32 个测试视角之间的样本标准差（ddof=0）。"
                    "vanilla3dgs7k 行为 3DGS 训练 7000 迭代的原始高斯，仅作参考基准，不是 SuGaR 结果。")
     add_table(doc, ["组别", "G1 均值", "G1 中位数", "G1 P90", "G1 中位数(相对 %)",
                     "G2 <0.5% (%) ↑", "G2 <1% (%) ↑", "G3 前景均值"],
               geom_rows(runs, refs), "几何精度：COLMAP 稀疏点到网格的距离与精度比例",
-              font_size=8.4, col_widths=[3.0, 1.9, 1.9, 1.9, 2.2, 1.9, 1.8, 1.6],
+              font_size=8.2, col_widths=[2.9, 1.8, 1.8, 1.8, 2.1, 1.9, 1.8, 1.9],
               note="G1 为点到网格表面的无符号距离（场景单位，↓ 越小越好），"
                    "相对值以相机空间尺度归一化；G2 为距离小于相机空间尺度 0.5% / 1% 的点占比（↑）；"
                    "G3 为网格顶点到最近稀疏点的平均距离（仅统计落在前景包围盒内的顶点，↓）。"
@@ -837,49 +993,110 @@ def build(doc, runs, refs, figs, args):
     add_table(doc, ["组别", "二面角均值 (°)", "二面角中位数 (°)", "二面角 P90 (°)",
                     "|二面角| 均值 (°)", "|二面角| P90 (°)", "raw>90° 占比 (%)"],
               smooth_rows(runs, refs), "网格法向平滑度（相邻面二面角统计）",
-              font_size=8.4, col_widths=[3.0, 2.3, 2.3, 2.2, 2.2, 2.1, 2.1],
+              font_size=8.2, col_widths=[2.9, 2.3, 2.3, 2.2, 2.2, 2.15, 2.15],
               note="raw 为相邻面法向夹角（依赖三角形绕序），|二面角| 取 min(raw, 180−raw)（与绕序无关）。"
                    "数值越低表示表面越平滑，但过低可能意味着细节被过度平滑，需结合图 3 与图 6 判断。")
     add_table(doc, ["组别", "λ", "训练墙钟 (min)", "每迭代耗时 (ms)", "峰值显存 (GB)", "结束时高斯数"],
               cost_rows(runs, refs), "训练代价（coarse SuGaR 阶段，7000→15000 共 8000 迭代）",
-              font_size=8.8, col_widths=[3.6, 1.6, 2.8, 2.8, 2.6, 2.6],
+              font_size=8.6, col_widths=[3.2, 1.6, 2.9, 2.9, 2.8, 2.8],
               note="调度方式在过程中发生过变化（见 4.1 节）：首轮两个 λ>0 组共享同一张 GPU 并行执行，"
                    "重跑时改为单卡顺序执行。因此墙钟时间不可直接横向比较，"
                    "每迭代耗时与峰值显存受调度影响较小，是更可比的代价指标。")
-    placeholder(doc, f"定量结果解读：逐个指标说明三组的差异方向与幅度（表 {TAB_RENDER}–表 {TAB_COST}），"
-                     f"明确哪些差异超出 CUDA 非确定性的量级（可参考 coarse_baseline 与 λ=0 的差），哪些不是")
+    analysis(doc, "P5", "定量结果解读", A)
 
     doc.add_heading("5.2 定性结果", level=2)
-    add_figure(doc, figs.get("fig1"), "三组对照的渲染质量与网格几何指标汇总（上排渲染、下排几何）",
+    add_figure(doc, figs.get("fig1"), "各组对照的渲染质量与网格几何指标汇总（上排渲染、下排几何）",
                width_cm=16.2, source="scripts/deliverables/make_figures.py")
     add_figure(doc, figs.get("fig2"), "固定测试视角的渲染结果与误差热图对比（误差图共用同一色条）",
                width_cm=16.2)
-    add_figure(doc, figs.get("fig3"), "三组网格的法向着色图对比（白色区域为网格空洞）", width_cm=16.2)
+    add_figure(doc, figs.get("fig3"), "各组网格的法向着色图对比（白色区域为网格空洞）", width_cm=16.2)
     add_figure(doc, figs.get("fig4"), "训练过程中的 L_DNC、SDF 法向损失、有效像素占比与总损失曲线",
                width_cm=16.2)
-    add_figure(doc, figs.get("fig5"), "DNC 中间量：渲染深度 D、渲染法向 N、深度差分法向 N_d 与有效掩码",
-               width_cm=15.5)
-    add_figure(doc, figs.get("fig5b"), "不同 λ 下 DNC 中间量的对比（同一迭代，各自的随机训练视角）",
+    add_figure(doc, figs.get("fig5b") or figs.get("fig5"),
+               "DNC 中间量逐组对比：深度 D、渲染法向 N、深度差分法向 N_d 与有效掩码（第 15000 迭代）",
                width_cm=16.2)
-    placeholder(doc, f"定性结果解读：结合图 {FIG_RENDER}（渲染与误差）与图 {FIG_NORMAL}（网格法向）"
-                     f"指出 DNC 组在哪些区域更干净、哪些区域更差，"
-                     f"并与表 {TAB_TOPO} 的碎片数、表 {TAB_SMOOTH} 的二面角统计互相印证")
+    analysis(doc, "P6", "定性结果解读", A)
+
+    # ---------------------------------------------------------------- 5.3 官方对照
+    doc.add_heading("5.3 官方 dn_consistency 对照", level=2)
+    para(doc,
+         "在写作后期核实到：SuGaR 官方仓库已经内置了同类正则 "
+         "`sugar_trainers/coarse_density_and_dn_consistency.py`（2024-09 加入仓库）。"
+         "本工作的 DNC 属于独立实现，报告如实披露这一点，并把官方实现按完全相同的 3DGS 检查点、"
+         "seed、迭代数与网格提取参数补跑成第五组对照，用来回答一个关键问题："
+         "失效到底是“思路不成立”还是“我的实现细节不对”。".replace("`", ""))
+    diff_rows = [
+        ["损失形式", "1 − |cos(N, N_d)|，取绝对值以消除三维椭球最短轴的符号歧义",
+         "1 − cos(N, N_d)，不取绝对值",
+         "绝对值让“法向整体翻转”也成为零损失解，放宽了约束"],
+        ["法向的合成方式", "把三通道世界系法向光栅化后，再逐像素归一化",
+         "只光栅化法向的 x、y 两个分量（与深度 z 打包成一次三通道光栅化），"
+         "再按单位长度解析恢复 z",
+         "官方得到的逐像素法向天然是单位向量；本工作 α 合成后再归一化，"
+         "低不透明度像素的方向不可靠"],
+        ["有效像素掩码", "有：背景、深度跳变、图像边缘 2 像素、‖N_raw‖>0.1 四条",
+         "无：全图像素参与",
+         "掩码会随训练进程改变参与像素集合，可能与优化目标相互作用"],
+        ["光栅化次数", "额外两次（深度一次、法向一次）", "额外一次（深度与法向打包）",
+         "本工作每迭代耗时高约 16%，官方约 6%"],
+    ]
+    add_table(doc, ["差异项", "本工作实现", "官方 dn_consistency 实现", "可能的影响"],
+              diff_rows, "本工作 DNC 与官方 dn_consistency 的实现差异清单",
+              font_size=8.4, col_widths=[2.0, 4.6, 4.6, 5.0],
+              note="两版实现的权重、起始迭代（λ=0.05、第 9000 迭代起）与训练预算完全一致；"
+                   "哪一处差异是失效主因需要逐项消融，本次未完成，不下结论。")
+    analysis(doc, "P12", "官方 dn_consistency 对照组的结果解读", A)
+
+    # ---------------------------------------------------------------- 5.4 提取端
+    doc.add_heading("5.4 提取端改动：Frosting 的自动 Poisson 深度", level=2)
+    para(doc,
+         "除了训练端的 DNC，本工作还移植了一项提取端改动：把 SuGaR 里写死的泊松重建深度 "
+         "（Poisson depth，默认 10）改成按场景尺度自动推算。"
+         "来源注明：算法取自同一作者的后续工作 Frosting 仓库 "
+         "（Anttwo/Frosting，frosting_extractors/coarse_shell.py 第 17–49 行），"
+         "本工作按该段逻辑自行实现并接到 SuGaR 的 extract_mesh.py 上，未复制代码。")
+    bullets(doc, [
+        "自动深度的做法：取前景且不透明的高斯，按相机空间尺度归一化后求其最近邻距离的分位数，"
+        "据此推出能分辨该尺度细节所需的八叉树深度，再对整数下取整并设下限；",
+        "本场景实测：参与统计的高斯 77,679 个，相机空间尺度 5.893，包围盒边长 12.956，"
+        "推算出的原始深度 10.883，下取整后为 10 —— 与 SuGaR 的默认值一致，"
+        "说明默认值在本场景恰好是合适的，自动化的价值在于换场景时不必手调；",
+        "顺带扫了顶点密度分位 quantile（默认 0.1，即丢掉密度最低的 10% 顶点）取 0 的情形，"
+        "用来观察“少裁剪”对碎片与精度的影响。",
+    ])
+    sweep = sweep_rows(summary_all)
+    add_table(doc, ["提取参数组合", "Poisson 深度 D", "quantile", "顶点数", "面数",
+                    "G1 中位数(%) ↓", "G2 <1%(%) ↑", "连通分量 ↓", "碎片 ↓",
+                    "最大分量占比(%) ↑", "G5 |二面角| 均值(°) ↓"],
+              sweep, "提取端扫参：同一个 λ=0 的 coarse 模型，只改网格提取参数",
+              font_size=7.0, head_size=7.0,
+              col_widths=[2.9, 1.25, 1.0, 1.6, 1.6, 1.3, 1.2, 1.3, 1.2, 1.4, 1.45],
+              note="所有组共用同一个 coarse SuGaR 检查点，因此渲染指标（PSNR/SSIM/LPIPS）与 λ=0 组"
+                   "完全相同，差异全部来自提取端；括号内为相对第一行（原版参数）的百分比变化。")
+    add_figure(doc, figs.get("fig7"),
+               "提取端扫参对网格碎片、几何精度与法向平滑度的影响", width_cm=16.2)
+    if A.get("P13"):
+        analysis(doc, "P13", "Frosting 自动 Poisson 深度一节的结果解读", A)
+    else:
+        para(doc, "该部分见附录表格，分析未完成。", size=10.5, family=FONT_SANS_NAME,
+             bold=True, color=COLORS["red"])
+        MISSING.append("P13（Frosting 自动 Poisson 深度的结果解读）尚未写入 "
+                       "notes/REPORT_ANALYSIS_fable.md，正文按约定写“该部分见附录表格，分析未完成”")
 
     # ---------------------------------------------------------------- 6 失败案例
     doc.add_heading("6 失败案例与代价", level=1)
-    add_figure(doc, figs.get("fig6"), "失败案例特写：背景树冠、细杆栏杆与顶部线状结构", width_cm=16.2)
+    add_figure(doc, figs.get("fig6"),
+               "失败案例特写：同一地面区域在 λ=0 / λ=0.05 / λ=0.2 下的渲染、误差与网格法向",
+               width_cm=16.2)
     para(doc, "预期中的三类失败模式（在计划阶段即已预注册，用于避免只挑好看的结果展示）：")
     bullets(doc, [
         "远景与天空：深度本身不可靠，差分得到的法向噪声大，DNC 可能把错误的一致性强加到背景上；",
         "物体边缘：跨越深度不连续处的中心差分会产生伪法向，掩码的深度梯度阈值只能部分缓解；",
         "细结构（栏杆、天线、电线）：一致性约束天然偏好光滑表面，细结构可能被过度平滑或直接丢失。",
     ])
-    placeholder(doc, f"失败案例分析：逐条对照图 {FIG_FAIL} 指出实际观察到的现象，并说明与 λ 取值的关系")
-    placeholder(doc, f"代价分析：训练时间 / 显存 / 渲染指标各付出多少代价"
-                     f"（数字取自表 {TAB_RENDER} 与表 {TAB_COST}），并给出“这个代价是否值得”的判断")
-    placeholder(doc, f"λ 敏感性：说明 λ=0.05 与 λ=0.2 的差异是否单调；"
-                     f"若 λ=0.2 出现退化（例如图 {FIG_DNC_CMP} 中深度图失去场景结构、"
-                     f"图 {FIG_CURVE}(c) 的有效像素占比异常升高到接近 1），必须在此明确写出并给出机理解释")
+    analysis(doc, "P7", "失败案例", A)
+    analysis(doc, "P8", "代价", A)
+    analysis(doc, "P9", "λ 敏感性", A)
 
     doc.add_heading("6.1 方法本身的局限", level=2)
     bullets(doc, [
@@ -894,10 +1111,8 @@ def build(doc, runs, refs, figs, args):
 
     # ---------------------------------------------------------------- 7 结论
     doc.add_heading("7 结论与下一步", level=1)
-    placeholder(doc, f"结论：3–5 条，每条都要能追溯到具体的表或图编号"
-                     f"（本报告共 {N_FIGURES} 图 {N_TABLES} 表）")
-    placeholder(doc, "下一步：若有更多时间会做什么（例如对 D 做 detach 的消融、在 train 场景上验证泛化、"
-                     "接上 refined 阶段、扫更细的 λ 网格）")
+    analysis(doc, "P10", "结论", A)
+    analysis(doc, "P11", "下一步", A)
 
     # ---------------------------------------------------------------- 附录
     doc.add_page_break()
@@ -939,9 +1154,36 @@ def build(doc, runs, refs, figs, args):
     else:
         missing_note(doc, f"未能从 {rel(NOTES_DIR / 'RUNLOG_eval.md')} 提取到评测命令块")
 
-    doc.add_heading("附录 B  日志与产物路径", level=1)
+    doc.add_heading("附录 B  留档对照：未打补丁的原版基线", level=1)
+    para(doc,
+         "阶段 2 用官方原版代码（未打 DNC 补丁、未固定 seed、无任何插桩）跑过一次完整基线，"
+         "run 名 coarse_baseline。它不参与正文的五组对照，只用来验证一件事："
+         "λ=0 时补丁没有改变原有代码路径。两组的差异应当落在 CUDA 光栅化非确定性的量级内。")
+    legacy_rows = []
+    for r in [legacy, runs[0] if runs else legacy]:
+        g = r.geometry or {}
+        t = dig(g, "G4_topology", default={}) or {}
+        frag = next((v for k, v in t.items() if k.startswith("n_fragment_components_lt_")), None)
+        legacy_rows.append([
+            r.label,
+            fmt_num(r.s("PSNR_dB_up") or dig(r.render, "psnr_db_mean"), 4),
+            fmt_num(r.s("SSIM_up") or dig(r.render, "ssim_mean"), 5),
+            fmt_num(r.s("LPIPS_VGG_down") or dig(r.render, "lpips_vgg_mean"), 5),
+            fmt_num((x * 100 if (x := to_float(dig(g, "G1_sparse_to_mesh_distance", "median_rel"))) is not None else None), 4),
+            f"{int(v):,}" if (v := to_float(t.get("n_connected_components"))) else "未完成",
+            f"{int(frag):,}" if frag else "未完成",
+            f"{int(v):,}" if (v := r.s("n_gaussians")) else "未完成",
+        ])
+    add_table(doc, ["组别", "PSNR (dB)", "SSIM", "LPIPS-VGG", "G1 中位数(%)",
+                    "连通分量", "碎片", "高斯数"],
+              legacy_rows, "未打补丁的原版基线与 λ=0 组的逐项对照（用于验证 λ=0 代码路径未变）",
+              font_size=8.6, col_widths=[3.6, 2.0, 2.0, 2.0, 2.0, 1.6, 1.5, 1.5],
+              note="两组用同一个 3DGS 检查点、同一划分与同一网格提取参数；"
+                   "coarse_baseline 未显式固定 seed，且 CUDA 光栅化的原子累加本身非确定。")
+
+    doc.add_heading("附录 C  日志与产物路径", level=1)
     art_rows = []
-    for r in runs + refs:
+    for r in runs + refs + [legacy]:
         art_rows.append([r.label, rel(r.run_dir) if r.run_dir else "未完成",
                          rel(r.train_log) if r.train_log else "未完成",
                          "、".join(r.sources) if r.sources else "未完成"])
@@ -957,7 +1199,7 @@ def build(doc, runs, refs, figs, args):
         f"改动留痕：{rel(NOTES_DIR)}/dnc_stage3.patch",
     ], size=10)
 
-    doc.add_heading("附录 C  评测指标的精确定义", level=1)
+    doc.add_heading("附录 D  评测指标的精确定义", level=1)
     add_table(doc, ["指标", "定义与单位", "方向"], [
         ["PSNR", "逐图 MSE 取 −10·log10 后对测试视角求均值，单位 dB", "↑"],
         ["SSIM", "3DGS 官方实现的 11×11 高斯窗结构相似度，无量纲", "↑"],
@@ -972,7 +1214,7 @@ def build(doc, runs, refs, figs, args):
     ], "评测指标的定义、单位与方向", font_size=8.6, col_widths=[2.2, 10.4, 3.4],
         note="全部指标由 scripts/eval/ 下的脚本统一计算，三组使用同一套代码与同一套参数。")
 
-    doc.add_heading("附录 D  参考文献", level=1)
+    doc.add_heading("附录 E  参考文献", level=1)
     for ref_line in REFERENCES:
         p = doc.add_paragraph()
         p.paragraph_format.space_after = DocxPt(5)
@@ -999,8 +1241,7 @@ def main():
     p = argparse.ArgumentParser(description="生成中文 DOCX 报告")
     p.add_argument("--runs", nargs="+", default=DEFAULT_RUNS)
     p.add_argument("--labels", nargs="+", default=None)
-    p.add_argument("--ref_runs", nargs="+",
-                   default=["vanilla3dgs7k", "coarse_baseline"],
+    p.add_argument("--ref_runs", nargs="+", default=["vanilla3dgs7k"],
                    help="只作参考行的 run（不参与三组对照结论）")
     p.add_argument("--manifest", type=Path, default=FIGURE_DIR / "figures_manifest.json")
     p.add_argument("--out", type=Path, default=REPORT_DIR / "report.docx")

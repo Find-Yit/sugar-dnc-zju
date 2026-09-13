@@ -20,6 +20,17 @@ def load(run):
     return json.load(open(p)) if os.path.exists(p) else None
 
 
+def load_vis(run):
+    """meshvis_<run>.json：4 个固定测试视角下 mesh 光栅化的命中率（越高 = 洞越少）。"""
+    p = os.path.join(M, f"meshvis_{run}.json")
+    if not os.path.exists(p):
+        return None
+    d = json.load(open(p))
+    cov = d.get("mesh_pixel_coverage") or {}
+    vals = [float(v) for v in cov.values()]
+    return sum(vals) / len(vals) if vals else None
+
+
 def frag(t):
     for k, v in t.items():
         if k.startswith("n_fragment_components_lt_"):
@@ -46,7 +57,7 @@ COLS = [("G1_median_rel_pct", "G1 median rel %↓", 4), ("G1_mean_rel_pct", "G1 
         ("n_vertices", "顶点数", 0), ("n_faces", "面数", 0),
         ("n_components", "连通分量↓", 0), ("largest_pct", "最大分量面占比%↑", 3),
         ("n_frag", "碎片(<100面)↓", 0), ("frag_faces", "碎片总面数↓", 0),
-        ("boundary", "边界边↓", 0),
+        ("boundary", "边界边↓", 0), ("hit_pct", "mesh 命中率%↑", 3),
         ("G5_abs_mean", "G5 abs mean°↓", 4), ("G5_abs_p90", "G5 abs P90°↓", 4)]
 
 
@@ -56,6 +67,8 @@ def main():
         d = load(run)
         if d:
             data[run] = row(d)
+            hv = load_vis(run)
+            data[run]["hit_pct"] = hv * 100 if hv is not None and hv <= 1.5 else (hv if hv is not None else float("nan"))
     if BASE not in data:
         sys.exit("no baseline")
     b = data[BASE]

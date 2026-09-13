@@ -1,0 +1,13 @@
+{
+  "tag": "m2p95_bg9_q0",
+  "n_components": 1216,
+  "n_fragments_lt100": 1194,
+  "largest_component_faces": 294928,
+  "largest_component_ratio": 0.9393479015577871,
+  "frag_pixel_ratio": {
+    "view00": 0.004078318685060258,
+    "view08": 0.0031990481428683677,
+    "view16": 0.004923915036274587,
+    "view24": 0.0019587154418615094
+  }
+}

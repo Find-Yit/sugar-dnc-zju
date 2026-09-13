@@ -1,0 +1,4 @@
+m1a_q0|2||--poisson_depth auto --poisson_depth_bg auto --depth_estimate_source centers --vertices_density_quantile 0 --extract_seed 0
+m2p95_m1a_q0|2|/scratch/users/nus/e1351071/test_zju/outputs/m2/pruned_p95/15000_pruned.pt|--poisson_depth auto --poisson_depth_bg auto --depth_estimate_source centers --vertices_density_quantile 0 --extract_seed 0
+m1a_q01|3||--poisson_depth auto --poisson_depth_bg auto --depth_estimate_source centers --vertices_density_quantile 0.1 --extract_seed 0
+m2p95_q0|3|/scratch/users/nus/e1351071/test_zju/outputs/m2/pruned_p95/15000_pruned.pt|--poisson_depth 10 --vertices_density_quantile 0 --extract_seed 0

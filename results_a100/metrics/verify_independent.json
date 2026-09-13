@@ -1,0 +1,192 @@
+{
+  "recomputed_cameras_extent": 5.847915124802881,
+  "recomputed_camera_center": [
+    0.08619995827423381,
+    -0.007175731297368587,
+    0.15169579028601274
+  ],
+  "n_cameras_total": 251,
+  "n_cameras_train": 219,
+  "n_colmap_total": 136029,
+  "n_colmap_track_ok": 123843,
+  "n_colmap_kept": 88066,
+  "method_notes": {
+    "components": "自写 union-find（面级，共享无向边）",
+    "boundary_edges": "自写 numpy 边表，counts==1",
+    "G1": "scipy cKDTree 近似：A=仅顶点，B=顶点+边中点+面重心（均为点到面精确距离的上界）"
+  },
+  "runs": {
+    "base_d10_q01": {
+      "mesh": "/scratch/users/nus/e1351071/test_zju/outputs/m/mesh_base_d10_q01/sugarmesh_3Dgs7000_densityestim02_sdfnorm02_level03_decim200000.ply",
+      "json": "/scratch/users/nus/e1351071/test_zju/outputs/metrics/geometry_m_base_d10_q01.json",
+      "n_vertices": {
+        "json": 205283,
+        "mine": 205283
+      },
+      "n_faces": {
+        "json": 370284,
+        "mine": 370284
+      },
+      "n_connected_components": {
+        "json": 2184,
+        "mine": 2184,
+        "rel": 0.0
+      },
+      "n_fragment_lt100": {
+        "json": 2094,
+        "mine": 2094,
+        "rel": 0.0
+      },
+      "n_boundary_edges": {
+        "json": 38450,
+        "mine": 38450,
+        "rel": 0.0
+      },
+      "G1_median_abs": {
+        "json": 0.004049293696880341,
+        "mine_kdtree_vertices": 0.020213146779189825,
+        "mine_kdtree_enriched": 0.010472720675134023,
+        "rel_vertices": 3.9917709833599995,
+        "rel_enriched": 1.5863079981584005
+      },
+      "G1_mean_abs": {
+        "json": 0.010347210972844434,
+        "mine_kdtree_vertices": 0.025315932548209474,
+        "mine_kdtree_enriched": 0.015711214367677962,
+        "rel_enriched": 0.5184008916906205
+      },
+      "G1_median_exact_subsample": {
+        "n_sample": 3000,
+        "mine_exact": 0.004092751306584413,
+        "json_full": 0.004049293696880341,
+        "rel": 0.010732145642474097,
+        "mine_kdtree_enriched_same_subsample": 0.010586895455261593,
+        "note": "精确点到三角面距离（Ericson 区域判别 + 面重心 KDTree 取 96 候选面），与 json 的 RaycastingScene 同口径；子样本 vs 全量导致的抽样噪声约 1%"
+      },
+      "edge_length": {
+        "median": 0.09038957377724743,
+        "mean": 0.1488457953675176
+      },
+      "poisson_depth_fg_used": 10,
+      "poisson_depth_bg_used": 10,
+      "vertices_density_quantile": 0.1
+    },
+    "m1a_q0": {
+      "mesh": "/scratch/users/nus/e1351071/test_zju/outputs/m/mesh_m1a_q0/sugarmesh_3Dgs7000_densityestim02_sdfnorm02_level03_decim200000.ply",
+      "json": "/scratch/users/nus/e1351071/test_zju/outputs/metrics/geometry_m_m1a_q0.json",
+      "n_vertices": {
+        "json": 163241,
+        "mine": 163241
+      },
+      "n_faces": {
+        "json": 321501,
+        "mine": 321501
+      },
+      "n_connected_components": {
+        "json": 1478,
+        "mine": 1478,
+        "rel": 0.0
+      },
+      "n_fragment_lt100": {
+        "json": 1456,
+        "mine": 1456,
+        "rel": 0.0
+      },
+      "n_boundary_edges": {
+        "json": 11033,
+        "mine": 11033,
+        "rel": 0.0
+      },
+      "G1_median_abs": {
+        "json": 0.004169186111539602,
+        "mine_kdtree_vertices": 0.023622104196778373,
+        "mine_kdtree_enriched": 0.01213698214825077,
+        "rel_vertices": 4.665879038452225,
+        "rel_enriched": 1.911115460798849
+      },
+      "G1_mean_abs": {
+        "json": 0.009763426160442488,
+        "mine_kdtree_vertices": 0.02850525387945848,
+        "mine_kdtree_enriched": 0.01665517306059449,
+        "rel_enriched": 0.7058738179507738
+      },
+      "G1_median_exact_subsample": {
+        "n_sample": 3000,
+        "mine_exact": 0.00418558227552014,
+        "json_full": 0.004169186111539602,
+        "rel": 0.003932701381489253,
+        "mine_kdtree_enriched_same_subsample": 0.012172072372534504,
+        "note": "精确点到三角面距离（Ericson 区域判别 + 面重心 KDTree 取 96 候选面），与 json 的 RaycastingScene 同口径；子样本 vs 全量导致的抽样噪声约 1%"
+      },
+      "edge_length": {
+        "median": 0.11263929150226036,
+        "mean": 0.21021520559439702
+      },
+      "poisson_depth_fg_used": 10,
+      "poisson_depth_bg_used": 9,
+      "vertices_density_quantile": 0.0
+    },
+    "m2p95_q0": {
+      "mesh": "/scratch/users/nus/e1351071/test_zju/outputs/m/mesh_m2p95_q0/sugarmesh_pruned_p95_level03_decim200000.ply",
+      "json": "/scratch/users/nus/e1351071/test_zju/outputs/metrics/geometry_m_m2p95_q0.json",
+      "n_vertices": {
+        "json": 164529,
+        "mine": 164529
+      },
+      "n_faces": {
+        "json": 325562,
+        "mine": 325562
+      },
+      "n_connected_components": {
+        "json": 1434,
+        "mine": 1434,
+        "rel": 0.0
+      },
+      "n_fragment_lt100": {
+        "json": 1412,
+        "mine": 1412,
+        "rel": 0.0
+      },
+      "n_boundary_edges": {
+        "json": 11352,
+        "mine": 11352,
+        "rel": 0.0
+      },
+      "G1_median_abs": {
+        "json": 0.004071233794093132,
+        "mine_kdtree_vertices": 0.02035640887598385,
+        "mine_kdtree_enriched": 0.010564593740904736,
+        "rel_vertices": 4.000058926981432,
+        "rel_enriched": 1.5949366396576594
+      },
+      "G1_mean_abs": {
+        "json": 0.011377832395780052,
+        "mine_kdtree_vertices": 0.03600648910960488,
+        "mine_kdtree_enriched": 0.020499986503048354,
+        "rel_enriched": 0.8017479771148358
+      },
+      "G1_median_exact_subsample": {
+        "n_sample": 3000,
+        "mine_exact": 0.004139548189309408,
+        "json_full": 0.004071233794093132,
+        "rel": 0.016779777008972607,
+        "mine_kdtree_enriched_same_subsample": 0.010842061710043274,
+        "note": "精确点到三角面距离（Ericson 区域判别 + 面重心 KDTree 取 96 候选面），与 json 的 RaycastingScene 同口径；子样本 vs 全量导致的抽样噪声约 1%"
+      },
+      "edge_length": {
+        "median": 0.1036402826611224,
+        "mean": 0.18826464330098736
+      },
+      "poisson_depth_fg_used": 10,
+      "poisson_depth_bg_used": 10,
+      "vertices_density_quantile": 0.0
+    }
+  },
+  "prune_p95": {
+    "n_total": 429423,
+    "n_pruned": 61038,
+    "n_kept": 368385,
+    "pruned_ratio": 0.14213956867703872,
+    "pruned_ratio_recomputed": 0.14213956867703872
+  }
+}

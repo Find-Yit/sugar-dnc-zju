@@ -28,6 +28,7 @@ os.environ.setdefault("OMP_NUM_THREADS", "4")      # noqa: E402
 os.environ.setdefault("MPLBACKEND", "Agg")         # noqa: E402
 
 import argparse                                     # noqa: E402
+import csv                                          # noqa: E402
 import json                                         # noqa: E402
 import re                                           # noqa: E402
 import sys                                          # noqa: E402
@@ -60,14 +61,18 @@ TABLE_SEQ: list[str] = []             # 表编号顺序
 # 即使对应的图还没生成、表还没有数据，也会插入一个"未生成/未完成"的占位框，
 # 这样交叉引用（"见表 5"）永远不会错位。
 FIG_FORMULA, FIG_METRICS, FIG_RENDER, FIG_NORMAL = 1, 2, 3, 4
-FIG_CURVE, FIG_DNC, FIG_SWEEP, FIG_FAIL = 5, 6, 7, 8
-N_FIGURES = 8
+FIG_CURVE, FIG_DNC, FIG_SWEEP = 5, 6, 7
+# 第 6 章（A100 提取端扩展实验）的四张图
+FIG_A100_FRAG, FIG_A100_NORMAL, FIG_A100_SKY, FIG_A100_SWEEP = 8, 9, 10, 11
+FIG_FAIL = 12
+N_FIGURES = 12
 TAB_ENV, TAB_DATA, TAB_PATCH, TAB_CFG, TAB_KILLED = 1, 2, 3, 4, 5
 TAB_RENDER, TAB_GEOM, TAB_TOPO, TAB_SMOOTH, TAB_COST = 6, 7, 8, 9, 10
-TAB_OFFICIAL, TAB_SWEEP, TAB_LEGACY, TAB_ARTIFACT, TAB_METRICDEF = 11, 12, 13, 14, 15
-N_TABLES = 15
+TAB_OFFICIAL, TAB_SWEEP, TAB_A100 = 11, 12, 13
+TAB_LEGACY, TAB_ARTIFACT, TAB_METRICDEF = 14, 15, 16
+N_TABLES = 16
 
-# Fable 写好的分析段落（P1–P13），按占位符编号原文插入，不改写、不润色
+# Fable 写好的分析段落（P1–P14），按占位符编号原文插入，不改写、不润色
 ANALYSIS_MD = NOTES_DIR / "REPORT_ANALYSIS_fable.md"
 
 REFERENCES = [
@@ -668,6 +673,88 @@ def sweep_rows(summary) -> list[list[str]]:
     return rows
 
 
+# ===================================================== 第 6 章：A100 提取端扩展实验
+
+A100_DIR = PROJ_ROOT / "outputs" / "a100"
+A100_RESULTS = A100_DIR / "results_a100"
+A100_SUMMARY = A100_RESULTS / "metrics" / "summary.csv"
+A100_FIGDIR = A100_RESULTS / "figures"
+A100_NOTES = A100_RESULTS / "notes"
+
+# （TAG, 中文配置名）；第一行是相对基准
+A100_TAGS = [
+    ("base_d10_q01",   "原版基线（D=10、q=0.1）"),
+    ("base_d10_q0",    "仅 q=0 顶点清洗"),
+    ("frosting_q0_s0", "Frosting 原样自动深度 + q=0"),
+    ("m1a_q0",         "M1+a 背景 Poisson 深度 D=9 + q=0"),
+    ("m2largest_q0",   "M2 原版“只留最大簇” + q=0（失败案例）"),
+    ("m2p95_q0",       "M2-B DBSCAN 剪枝 p95 + q=0"),
+    ("m2p95_bg9_q0",   "M2-B + M1+a 组合（本工作最优）"),
+]
+
+
+def load_a100_summary() -> dict[str, dict]:
+    """读 A100 机器回传的提取端汇总表（outputs/a100/results_a100/metrics/summary.csv）。"""
+    if not A100_SUMMARY.exists():
+        return {}
+    with open(A100_SUMMARY, newline="", encoding="utf-8") as f:
+        return {rec["TAG"]: rec for rec in csv.DictReader(f) if rec.get("TAG")}
+
+
+def _a100_cell(val, base, fmt, is_base, nd=1, pct=True):
+    """数值 + （相对原版基线的百分比变化）；基准行不带括号。"""
+    if val is None:
+        return "未完成"
+    txt = fmt(val)
+    if is_base or not pct:
+        return txt
+    return f"{txt}（{_pct_delta(val, base, nd)}）"
+
+
+def a100_rows(data: dict[str, dict]) -> list[list[str]]:
+    if not data:
+        return []
+    base = data.get("base_d10_q01") or {}
+    def g(rec, col):
+        return to_float(rec.get(col))
+    b = {c: g(base, c) for c in ("n_components", "n_fragments_lt100",
+                                 "largest_component_ratio", "n_boundary_edges",
+                                 "G1_median_abs", "n_faces")}
+    fint = lambda v: f"{int(round(v)):,}"
+    rows = []
+    for tag, label in A100_TAGS:
+        rec = data.get(tag)
+        if not rec:
+            rows.append([label] + ["未完成"] * 9)
+            continue
+        is_base = (tag == "base_d10_q01")
+        pr = to_float(rec.get("prune_ratio"))
+        rows.append([
+            label,
+            f"{rec.get('D_fg','—')} / {rec.get('D_bg','—')}",
+            rec.get("quantile", "—"),
+            "—" if pr is None else f"{pr*100:.1f}%",
+            _a100_cell(g(rec, "n_components"), b["n_components"], fint, is_base),
+            _a100_cell(g(rec, "n_fragments_lt100"), b["n_fragments_lt100"], fint, is_base),
+            _a100_cell(g(rec, "largest_component_ratio"), b["largest_component_ratio"],
+                       lambda v: f"{v*100:.1f}%", is_base),
+            _a100_cell(g(rec, "n_boundary_edges"), b["n_boundary_edges"], fint, is_base),
+            _a100_cell(g(rec, "G1_median_abs"), b["G1_median_abs"],
+                       lambda v: f"{v:.5f}", is_base),
+            _a100_cell(g(rec, "n_faces"), b["n_faces"], fint, is_base),
+        ])
+    return rows
+
+
+def a100_unified_para(A: dict[str, str]) -> str | None:
+    """从 P14 里原文取出最后一段“与训练端结果的统一解读”，用于摘要与结论。"""
+    body = A.get("P14") or ""
+    for line in body.split("\n"):
+        if line.strip().startswith("与训练端结果的统一解读"):
+            return line.strip()
+    return None
+
+
 def cost_rows(runs, refs):
     rows = []
     for r, is_ref in [(x, False) for x in runs] + [(x, True) for x in refs]:
@@ -710,7 +797,7 @@ def build(doc, runs, refs, figs, args):
     runlog_s34 = read_text(NOTES_DIR / "RUNLOG_s34.md")
     runlog_eval = read_text(NOTES_DIR / "RUNLOG_eval.md")
     patch_text = read_text(NOTES_DIR / "dnc_stage3.patch")
-    A = load_analysis()          # Fable 的 P1–P13 正文
+    A = load_analysis()          # Fable 的 P1–P14 正文
     summary_all = load_summary()
     legacy = build_run("coarse_baseline", DEFAULT_LABELS["coarse_baseline"], summary=summary_all)
 
@@ -729,7 +816,8 @@ def build(doc, runs, refs, figs, args):
         ("数据集与场景", "Tanks & Temples / Truck（3DGS 官方打包 tandt_db.zip，含 COLMAP 稀疏重建）"),
         ("改动点", "① 训练端：在 coarse SuGaR 训练主循环中加入深度-法向一致性正则 L_DNC"
                    "（借鉴 2DGS 思路，自行实现）；② 提取端：把泊松重建深度改为按场景尺度自动推算"
-                   "（移植自 Frosting）"),
+                   "（移植自 Frosting）；③ 提取端扩展（A100）：q=0 清洗 + M2-B DBSCAN 剪枝 + "
+                   "M1+a 背景 Poisson 深度，碎片 −43%，渲染指标不变"),
         ("对照组", "训练端五组完整重跑：λ=0 / 0.05 / 0.2 / 0.2+detach 诊断 / 官方 dn_consistency；"
                    "提取端在同一个 λ=0 模型上扫 Poisson 深度与顶点密度分位"),
         ("报告生成时间", now),
@@ -772,6 +860,9 @@ def build(doc, runs, refs, figs, args):
          "实验在 Tanks & Temples 的 Truck 场景上以 λ ∈ {0, 0.05, 0.2} 做三组完整对照，"
          "统一评测渲染质量（PSNR / SSIM / LPIPS）与网格几何（稀疏点到网格距离、拓扑碎片、法向平滑度）。")
     analysis(doc, "P1", "摘要结论句", A)
+    _uni_abs = a100_unified_para(A)
+    if _uni_abs:
+        rich_para(doc, _uni_abs)
 
     doc.add_heading("预注册的可检验假设", level=2)
     for h, desc in [
@@ -1083,8 +1174,89 @@ def build(doc, runs, refs, figs, args):
         MISSING.append("P13（Frosting 自动 Poisson 深度的结果解读）尚未写入 "
                        "notes/REPORT_ANALYSIS_fable.md，正文按约定写“该部分见附录表格，分析未完成”")
 
-    # ---------------------------------------------------------------- 6 失败案例
-    doc.add_heading("6 失败案例与代价", level=1)
+    # ---------------------------------------------------------------- 6 A100 提取端扩展
+    doc.add_heading("6 扩展实验：提取端改进的完整扫描（4×A100）", level=1)
+    a100 = load_a100_summary()
+
+    doc.add_heading("6.1 硬件、模型来源与可比性", level=2)
+    rich_para(doc,
+              "本章实验在另一台机器上完成：NSCC 的 4×A100-SXM4-40GB 节点，运行在 NGC Singularity 镜像 "
+              "pytorch_23.05_py3.sif 内，torch 2.4.1+cu121、pytorch3d 0.7.8、open3d 0.19.0，"
+              "代码基于本仓库 dnc 分支 commit 39c0f56（对应官方 SuGaR 7c10c4a）。"
+              "与前面各章不同的是硬件与 CUDA 版本，而**被改动的对象完全相同**。")
+    bullets(doc, [
+        "该机器没有重训任何模型：全部 9 组提取 run 都加载同一个由 hopper H200 训练并回传的 "
+        "coarse 检查点 outputs/runs/coarse_base_seed0/…/15000.pt（即正文的 λ=0 基线组），"
+        "只重跑了剪枝（prune_coarse_model.py）、提取（extract_mesh.py）与评测；",
+        "因此高斯本身未被改动，渲染指标按构造严格不变，恒等于正文 λ=0 组的 "
+        "PSNR 24.6530 / SSIM 0.85644 / LPIPS 0.20280，本章只报几何与拓扑指标；",
+        "该机器自己的原版提取基线（D=10、q=0.1）碎片分量为 2094，而 hopper 侧同一模型为 2137，"
+        "相差 2%，来自泊松求解与顶点清洗的非确定性；同参重复的噪声底实测 0.4%，判据保守取 5%。"
+        "本章所有百分比均以该机器自己的 2094 为基准，不跨机器相减；",
+        "几何评测脚本 eval_geometry.py 与 hopper 侧同口径同脚本，cameras_extent = 5.847915 "
+        "两机一致（该机器已独立复算，见 verify_independent.json）。",
+    ])
+    para(doc, f"来源与可比性的完整说明见 {rel(A100_NOTES / 'PROVENANCE.md')}，"
+              f"交付清单见 {rel(A100_DIR / 'A100_DELIVERY.md')}。",
+         size=9.5, family=FONT_SANS_NAME, color=COLORS["muted"])
+
+    doc.add_heading("6.2 方法来源声明与本工作的自有改动", level=2)
+    for _it in [
+        "**M1（自动 Poisson 深度）**：逐字移植自 Anttwo/Frosting 的 "
+        "frosting_extractors/coarse_shell.py 第 17–49 行，未做逻辑改动；",
+        "**M2（DBSCAN 剪枝）**：思路来自 prajwalcr/2d-sugar 的 gaussian_model.py:429，"
+        "其原版规则是“只保留最大簇”；",
+        "**M1+a（本工作自有改动）**：把前景与背景分开估计密度、各自使用自己的 Poisson 深度"
+        "（本场景得到前景 D=10、背景 D=9），而不是全场景共用一个深度；",
+        "**M2-B（本工作自有改动）**：把“只留最大簇”改为“保留所有大小 ≥ 组内点数一定比例的簇”，"
+        "并在前景/背景分区各自估计 DBSCAN 的 eps；这不是 2d-sugar 的贡献度评分方案；",
+        "**q 参数化（本工作自有改动）**：把顶点密度清洗分位数 quantile 与提取随机种子 "
+        "extract_seed 提为命令行参数（原版提取写死 0.1 且无种子、不可复现）。",
+    ]:
+        rich_para(doc, _it, style="List Bullet")
+    para(doc, f"两份补丁与参数表：{rel(A100_DIR / 'patches_a100')}/m1a_q0_extract.patch、"
+              f"m2b_cluster_prune.patch、PARAMS.md（其中含“默认参数=原版行为”的证据）。",
+         size=9.5, family=FONT_SANS_NAME, color=COLORS["muted"])
+
+    doc.add_heading("6.3 定量结果", level=2)
+    a100_tab = a100_rows(a100)
+    add_table(doc,
+              ["配置", "D_fg / D_bg", "q", "剪枝比例", "连通分量 ↓", "碎片 ↓",
+               "最大分量占比 ↑", "边界边 ↓", "G1 中位(abs) ↓", "面数"],
+              a100_tab,
+              "提取端扩展扫描：同一个 λ=0 的 coarse 模型，只改提取阶段（4×A100）",
+              font_size=6.8, head_size=6.8,
+              col_widths=[3.3, 1.2, 0.7, 1.1, 1.5, 1.5, 1.8, 1.5, 1.75, 1.55],
+              note="括号内为相对第一行（该机器自己的原版基线）的百分比变化；剪枝比例为空表示未做 M2 剪枝。"
+                   "G1 中位数为 COLMAP 稀疏点到网格的距离中位数（绝对值、场景单位），"
+                   "场景尺度 cameras_extent = 5.847915。渲染指标 PSNR/SSIM/LPIPS 按构造与 λ=0 组完全相同，"
+                   f"故本表不列。数据来源：{rel(A100_SUMMARY)}（列说明同目录 COLUMNS.md）。")
+    if not a100_tab:
+        MISSING.append(f"未找到 {rel(A100_SUMMARY)}，第 6 章定量表为空")
+
+    doc.add_heading("6.4 可视化证据", level=2)
+    a100_src = "由 A100 机器生成，数据见 results_a100"
+    for fname, cap in [
+        ("fig_fragments_compare_base_d10_q01_vs_m2p95_bg9_q0.png",
+         "碎片着色对比：原版基线（上排）与 M2-B + M1+a 组合（下排）在 4 个固定测试视角下的"
+         "网格连通分量着色，小碎片以杂色显示；下排的杂色斑块明显减少"),
+        ("fig_mesh_normal_compare.png",
+         "网格法向对比：6 组提取配置 × 4 个固定测试视角的网格法向图；"
+         "前景卡车区域肉眼无差别，差异集中在背景树冠等低密度区域"),
+        ("fig_sky_closure_evidence.png",
+         "天空封口证据：Poisson 重建在天空区域生成的大面片，说明“可见表面覆盖率”"
+         "从 92.0% 升到 99.98% 中有相当部分并非真实几何，该指标只能作辅助"),
+        ("fig_sweep_fragments_G1_largest.png",
+         "提取端扫参：碎片分量数、G1 中位距离与最大分量面数占比随各配置的变化"),
+    ]:
+        pth = A100_FIGDIR / fname
+        add_figure(doc, pth if pth.exists() else None, cap, width_cm=16.2, source=a100_src)
+
+    doc.add_heading("6.5 结果解读", level=2)
+    analysis(doc, "P14", "提取端扩展实验（A100）的结果解读", A)
+
+    # ---------------------------------------------------------------- 7 失败案例
+    doc.add_heading("7 失败案例与代价", level=1)
     add_figure(doc, figs.get("fig6"),
                "失败案例特写：同一地面区域在 λ=0 / λ=0.05 / λ=0.2 下的渲染、误差与网格法向",
                width_cm=16.2)
@@ -1098,7 +1270,7 @@ def build(doc, runs, refs, figs, args):
     analysis(doc, "P8", "代价", A)
     analysis(doc, "P9", "λ 敏感性", A)
 
-    doc.add_heading("6.1 方法本身的局限", level=2)
+    doc.add_heading("7.1 方法本身的局限", level=2)
     bullets(doc, [
         "几何评价使用 COLMAP 稀疏点而非稠密真值网格，只能衡量“网格是否贴合可靠的稀疏观测”，"
         "不能衡量未被稀疏点覆盖区域的正确性；",
@@ -1109,9 +1281,12 @@ def build(doc, runs, refs, figs, args):
         "λ 过大时该风险上升。",
     ])
 
-    # ---------------------------------------------------------------- 7 结论
-    doc.add_heading("7 结论与下一步", level=1)
+    # ---------------------------------------------------------------- 8 结论
+    doc.add_heading("8 结论与下一步", level=1)
     analysis(doc, "P10", "结论", A)
+    _uni = a100_unified_para(A)
+    if _uni:
+        rich_para(doc, _uni)
     analysis(doc, "P11", "下一步", A)
 
     # ---------------------------------------------------------------- 附录
@@ -1153,6 +1328,22 @@ def build(doc, runs, refs, figs, args):
         code_block(doc, "\n\n".join(joined))
     else:
         missing_note(doc, f"未能从 {rel(NOTES_DIR / 'RUNLOG_eval.md')} 提取到评测命令块")
+
+    doc.add_heading("A.5 提取端扩展实验（A100）的复现命令", level=2)
+    para(doc,
+         "第 6 章的全部命令由 A100 机器原样记录，未在本报告中改写；"
+         "因为运行在 NGC Singularity 容器内、路径前缀与本机不同，此处只给索引，不逐字复制：",
+         size=10)
+    bullets(doc, [
+        f"逐条确切命令（剪枝 → 提取 → 评测 → 汇总 → 独立复算 → 可视化）："
+        f"{rel(A100_NOTES / 'COMMANDS.md')}",
+        f"脚本清单与复现顺序说明：{rel(A100_DIR / 'scripts_a100' / 'README.md')}"
+        f"（脚本本体同目录，含 extract_one.sh / eval_one.sh / run_grid.sh 等）",
+        f"参数表与“默认值=原版行为”的证据：{rel(A100_DIR / 'patches_a100' / 'PARAMS.md')}",
+        f"覆盖率指标的定义与局限：{rel(A100_DIR / 'scripts_a100' / 'COVERAGE_METRIC.md')}",
+        f"负结果与偏离记录：{rel(A100_NOTES / 'NEGATIVE_RESULTS.md')}；"
+        f"完整结果记录：{rel(A100_NOTES / 'RESULTS_m_nscc_2026-09-13.md')}",
+    ], size=9.5)
 
     doc.add_heading("附录 B  留档对照：未打补丁的原版基线", level=1)
     para(doc,
@@ -1197,6 +1388,9 @@ def build(doc, runs, refs, figs, args):
         f"运行记录：{rel(NOTES_DIR)}/RUNLOG.md、RUNLOG_s34.md、RUNLOG_eval.md",
         f"环境记录：{rel(NOTES_DIR)}/ENV.md、pip_freeze.txt",
         f"改动留痕：{rel(NOTES_DIR)}/dnc_stage3.patch",
+        f"提取端扩展实验（A100）全部产物：{rel(A100_DIR)}/"
+        f"（results_a100/metrics、results_a100/figures、results_a100/notes、"
+        f"patches_a100、scripts_a100、A100_DELIVERY.md）",
     ], size=10)
 
     doc.add_heading("附录 D  评测指标的精确定义", level=1)

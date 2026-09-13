@@ -1,0 +1,26 @@
+{
+  "poisson_depth_arg": "10",
+  "poisson_depth_is_auto": false,
+  "poisson_depth_bg_arg": "same",
+  "poisson_depth_bg_is_auto": false,
+  "poisson_depth_bg_is_same_as_fg": true,
+  "depth_estimate_source": "centers",
+  "max_poisson_depth": 10,
+  "extract_seed": 0,
+  "vertices_density_quantile": 0.0,
+  "cell_size_nn_distance_ratio": 100.0,
+  "only_report_depth": false,
+  "coarse_model_path": "/scratch/users/nus/e1351071/test_zju/outputs/m2/pruned_p95/15000_pruned.pt",
+  "scene_path": "/scratch/users/nus/e1351071/test_zju/data/tandt/truck",
+  "gs_checkpoint_path": "/scratch/users/nus/e1351071/test_zju/outputs/baseline/gs_truck/",
+  "surface_level_arg": 0.3,
+  "decimation_target_arg": 200000,
+  "eval_split": true,
+  "poisson_depth_used": 10,
+  "poisson_depth_fg_used": 10,
+  "poisson_depth_bg_used": 10,
+  "mesh_paths": [
+    "/scratch/users/nus/e1351071/test_zju/outputs/m/mesh_m2p95_q0/sugarmesh_pruned_p95_level03_decim200000.ply"
+  ],
+  "extraction_wall_clock_s": 321.87381649017334
+}

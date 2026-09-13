@@ -1,0 +1,4 @@
+frosting_q0_s0|0||--poisson_depth auto --vertices_density_quantile 0 --extract_seed 0
+m2default_q0|0|/scratch/users/nus/e1351071/test_zju/outputs/m2/pruned_default/15000_pruned.pt|--poisson_depth 10 --vertices_density_quantile 0 --extract_seed 0
+m2largest_q0|1|/scratch/users/nus/e1351071/test_zju/outputs/m2/pruned_largest_global/15000_pruned.pt|--poisson_depth 10 --vertices_density_quantile 0 --extract_seed 0
+m2frac002_m1a_q0|1|/scratch/users/nus/e1351071/test_zju/outputs/m2/pruned_frac002/15000_pruned.pt|--poisson_depth auto --poisson_depth_bg auto --vertices_density_quantile 0 --extract_seed 0

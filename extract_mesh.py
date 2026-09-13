@@ -41,6 +41,26 @@ if __name__ == "__main__":
                         help='If True, use marching cubes to extract mesh.')
     parser.add_argument('--use_vanilla_3dgs', type=str2bool, default=False, 
                         help='If True, use vanilla 3DGS to extract mesh.')
+
+    # ----- [ADDED] Poisson reconstruction knobs (ported from Gaussian Frosting) -----
+    # Frosting: frosting_extractors/coarse_shell.py:17-49 (compute_optimal_poisson_depth)
+    #           train_full_pipeline.py:31-33 (--poisson_depth / --cleaning_quantile)
+    parser.add_argument('--poisson_depth', type=str, default='10',
+                        help="Octree depth of the Poisson surface reconstruction. "
+                             "An integer (SuGaR's original hard-coded value is 10), or 'auto' "
+                             "(equivalently '-1') to compute it automatically from the SuGaR model "
+                             "with Frosting's compute_optimal_poisson_depth.")
+    parser.add_argument('--vertices_density_quantile', type=float, default=0.1,
+                        help="Quantile of the Poisson vertex densities below which vertices are removed "
+                             "(Frosting calls this --cleaning_quantile). 0.1 for most real scenes, "
+                             "0. works well for most synthetic scenes. 0. disables the cleaning.")
+    parser.add_argument('--cell_size_nn_distance_ratio', type=float, default=100.,
+                        help="Constant of Frosting's automatic depth formula "
+                             "D = min(floor(-log2(ratio * d_q)), 10). Only used when --poisson_depth auto. "
+                             "Larger ratio -> smaller depth.")
+    parser.add_argument('--only_report_depth', type=str2bool, default=False,
+                        help="If True, only load the model, compute + print + dump the automatic Poisson "
+                             "depth to <mesh_output_dir>/extract_stats.json, then exit without extracting.")
     
     args = parser.parse_args()
     

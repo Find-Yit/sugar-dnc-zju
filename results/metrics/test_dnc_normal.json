@@ -1,0 +1,157 @@
+{
+  "n_tests": 8,
+  "n_pass": 8,
+  "all_pass": true,
+  "device": "cpu",
+  "module": "/scratch/e1351071/zju_test/repo/SuGaR/sugar_utils/dnc_utils.py",
+  "results": [
+    {
+      "test": "pixel_grid_roundtrip_vs_get_points_depth_in_depth_map",
+      "pass": true,
+      "max_abs_pixel_err_u": 6.103515625e-05,
+      "max_abs_pixel_err_v": 6.103515625e-05,
+      "tol": 0.01
+    },
+    {
+      "test": "unproject_matches_pytorch3d_unproject_points",
+      "pass": true,
+      "max_abs_err": 1.1920928955078125e-07,
+      "value_scale": 2.499943256378174,
+      "tol": 0.0002499943256378174
+    },
+    {
+      "test": "plane_normals_ndc_convention",
+      "pass": true,
+      "worst_min_cos": 0.9999998807907104,
+      "worst_min_abs_cos": 0.9999998807907104,
+      "threshold": 0.99,
+      "cases": [
+        {
+          "n_gt": [
+            0.0,
+            0.0,
+            -1.0
+          ],
+          "min_cos": 1.0,
+          "mean_cos": 1.0
+        },
+        {
+          "n_gt": [
+            0.2873,
+            0.0,
+            -0.9578
+          ],
+          "min_cos": 1.0,
+          "mean_cos": 1.0
+        },
+        {
+          "n_gt": [
+            0.0,
+            0.3714,
+            -0.9285
+          ],
+          "min_cos": 1.0,
+          "mean_cos": 1.0
+        },
+        {
+          "n_gt": [
+            0.3941,
+            -0.4729,
+            -0.7881
+          ],
+          "min_cos": 0.9999999403953552,
+          "mean_cos": 1.0
+        },
+        {
+          "n_gt": [
+            -0.5659,
+            0.1617,
+            -0.8085
+          ],
+          "min_cos": 0.9999998807907104,
+          "mean_cos": 1.0
+        },
+        {
+          "n_gt": [
+            0.6656,
+            0.4992,
+            -0.5547
+          ],
+          "min_cos": 1.0,
+          "mean_cos": 1.0
+        }
+      ]
+    },
+    {
+      "test": "plane_normals_pinhole_convention",
+      "pass": true,
+      "worst_min_cos": 0.9999999403953552,
+      "threshold": 0.99,
+      "cases": [
+        {
+          "n_gt": [
+            0.0,
+            0.0,
+            -1.0
+          ],
+          "min_cos": 1.0
+        },
+        {
+          "n_gt": [
+            0.3651,
+            0.1826,
+            -0.9129
+          ],
+          "min_cos": 0.9999999403953552
+        },
+        {
+          "n_gt": [
+            -0.4729,
+            0.3941,
+            -0.7881
+          ],
+          "min_cos": 0.9999999403953552
+        },
+        {
+          "n_gt": [
+            0.6155,
+            -0.4924,
+            -0.6155
+          ],
+          "min_cos": 1.0
+        }
+      ]
+    },
+    {
+      "test": "loss_values_perfect_flipped_orthogonal",
+      "pass": true,
+      "L_perfect": 8.603299406217957e-09,
+      "L_flipped(-N)": 8.603299406217957e-09,
+      "L_orthogonal": 0.9999948143959045,
+      "valid_ratio": 0.9587500095367432,
+      "n_valid": 36816
+    },
+    {
+      "test": "mask_background_discontinuity_and_backward",
+      "pass": true,
+      "mask_pixels_in_background": 0,
+      "mask_pixels_on_seam_column": 0,
+      "mask_pixels_in_foreground": 18252,
+      "grads_finite": true,
+      "normal_grad_nonzero": true,
+      "loss": 1.8160280390588923e-08
+    },
+    {
+      "test": "zero_valid_pixels_is_safe",
+      "pass": true,
+      "loss": 0.0
+    },
+    {
+      "test": "transform_normals_equals_rigid_rotation",
+      "pass": true,
+      "max_abs_err_vs_point_difference": 7.152557373046875e-07,
+      "max_abs_norm_deviation": 2.980232238769531e-07,
+      "tol": 0.0001
+    }
+  ]
+}

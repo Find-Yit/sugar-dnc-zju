@@ -1,0 +1,40 @@
+{
+  "run_name": "coarse_dnc02_detach",
+  "n_test_views": 32,
+  "n_train_views": 219,
+  "psnr_db_mean": 24.399450838565826,
+  "psnr_db_std": 1.1013886559722605,
+  "ssim_mean": 0.849449772387743,
+  "ssim_std": 0.02198835782974007,
+  "n_gaussians": 429406,
+  "config": {
+    "scene_path": "/scratch/e1351071/zju_test/data/tandt/truck",
+    "gs_checkpoint": "/scratch/e1351071/zju_test/outputs/baseline/gs_truck",
+    "iteration_to_load": 7000,
+    "coarse_pt": "/scratch/e1351071/zju_test/outputs/runs/coarse_dnc02_detach/sugarcoarse_3Dgs7000_densityestim02_sdfnorm02/15000.pt",
+    "eval_split_interval": 8,
+    "renderer": "sugar_gaussian_rasterizer",
+    "sh_degree": 3,
+    "gpu": 0,
+    "image_height": 546,
+    "image_width": 979,
+    "fixed_vis_test_view_indices": [
+      0,
+      8,
+      16,
+      24
+    ],
+    "error_heatmap_vmax": 0.25,
+    "error_heatmap_colormap": "matplotlib turbo (256-entry LUT)",
+    "low_opacity_pruning_applied": false,
+    "note": "coarse .pt 按训练结束状态直接评测，不再做 opacity<0.5 剪枝（该剪枝在训练 9000 iter 已执行）"
+  },
+  "metric_directions": {
+    "psnr_db": "up",
+    "ssim": "up",
+    "lpips_vgg": "down"
+  },
+  "wall_clock_sec": 35.54,
+  "lpips_vgg_mean": 0.21333114709705114,
+  "lpips_vgg_std": 0.025432617890419666
+}

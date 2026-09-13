@@ -1,0 +1,293 @@
+====================================================================
+计划：浙大李俊成老师组 6 小时考核 —— SuGaR（3DGS→Mesh）复现 + 改动 + 对照实验
+====================================================================
+制定：Claude Fable 5.1（计划 + 验收）      执行：opus-executor（claude-opus-5，effort max）
+创建：2026-09-13 05:40（考核开始约 05:20，硬截止约 11:20）
+状态：v1.2，2026-09-13 06:05 用户批准：阶段 1+2、改动方案 A（DNC，引用 2DGS）、评测方案（§2b）；GitHub 仓库 https://github.com/Find-Yit/sugar-dnc-zju.git；允许多执行者并行
+
+--------------------------------------------------------------------
+TL;DR
+--------------------------------------------------------------------
+一句话：用 Tanks&Temples 的 Truck 场景，在 H200 上跑通 3DGS(7k) → coarse SuGaR(density 正则, 7k→15k)
+→ Poisson Mesh 的短流水线；改动点是在 coarse SuGaR 训练主循环加入「深度-法向一致性损失」
+（可检验假设：让高斯法向与渲染深度的几何法向一致 → 表面点法向更稳、Poisson 网格更干净、
+漂浮碎片更少），做 baseline / λ=0.05 / λ=0.2 三组完整对照，报告几何 + 渲染指标与失败案例，
+最后产出中文 report.pdf 并推到 GitHub（SSH 已验证可用，账号 Find-Yit）。
+
+要点：
+1. 环境走「已知能成功」的组合：torch 2.4.1+cu121（PyPI 默认即 cu121，与系统 nvcc 12.1 完全一致）
+   + pytorch3d 0.7.8 官方预编译 wheel（py310_cu121_pyt241 已确认存在）+ 源码编译 3DGS 的两个小 CUDA 扩展。
+   这是本机唯一"零风险"路线；不选 CLAUDE.md 默认的 torch 2.8（pytorch3d 无预编译 wheel，需源码编译 20–40 min）。
+2. 数据已就绪：data/tandt_db.zip（683 MB，含 COLMAP）已下载完成；用 Truck，llffhold=8 划分。
+3. 改动进入训练主流程（coarse_density.py 的 loss 里），非后处理；有明确动机与超参 λ 两个取值。
+4. 三组 coarse 运行用 2 张 H200 并行；改动实现与 baseline 训练并行进行。
+5. 每阶段执行者写 SELF_CHECK.md，Fable 用独立脚本复算关键数字后才放行。
+6. 需要用户做的事：① 批准本计划；② 在 GitHub 上新建一个**空的公开仓库**（建议名 sugar-dnc-zju），把 URL 给我
+   （本机无 gh，无法自动建仓；SSH push 已验证可用）；③ 在登录节点确认 PBS 作业剩余 walltime ≥ 6h。
+
+--------------------------------------------------------------------
+0. 已核实的事实（2026-09-13 05:30–05:40，不必重查）
+--------------------------------------------------------------------
+- GPU 2×H200 空闲（0 MiB 已用）；驱动 575.57.08；系统 nvcc 12.1（/usr/local/cuda-12.1）；Python 3.10.12；
+  ML venv /scratch/e1351071/virtualenvs/zju_test 干净（只有 pip/setuptools）。
+- SuGaR 已 clone 到 repo/SuGaR，commit 7c10c4ae4a267dece512f5c7f40ed212a0a2ab44（2024-09-24），
+  含子模块 gaussian_splatting（内含 diff-gaussian-rasterization + simple-knn，glm 已随之克隆）。
+- SuGaR 依赖（按 import 扫描）：torch, torchvision, pytorch3d, open3d, plyfile, rich, tqdm, plotly, PIL, numpy,
+  scipy/scikit-learn（仅部分工具）；nvdiffrast 仅 refined 阶段用（本次不需要）。
+- 训练脚本参数：train_coarse_density.py: -s scene, -c 3dgs_ckpt, -i iter, -o out, --eval, -e estimation_factor(0.2),
+  -n normal_factor(0.2), --gpu。extract_mesh.py: -s -c -i -m coarse.pt -l surface_level -d decimation -o out --eval --gpu。
+- coarse_density 训练器默认：从 3DGS 7000 iter 起，entropy 正则 7000–9000，SDF/density 正则 9000 开始，
+  硬剪枝 opacity<0.5 于 9000，总 15000 iter；density 模式 sdf_estimation_factor=0.2, normal_factor=0.2。
+- 数据：data/tandt_db.zip 683,628,995 字节，已下载完成，内含 tandt/{truck,train} 与 db/{drjohnson,playroom}。
+- GitHub：~/.ssh/id_ed25519_github 存在，`ssh -T git@github.com` 返回 "Hi Find-Yit!"；本机无 gh CLI。
+- pytorch3d 官方 wheel 索引：py310_cu121_pyt241 → pytorch3d-0.7.8-cp310-cp310-linux_x86_64.whl 存在；
+  pyt250/pyt260 目录不存在。torch 2.4.1 PyPI wheel 依赖 nvidia-*-cu12==12.1.x（即 cu121 构建）。
+
+--------------------------------------------------------------------
+1. 交付物清单（对照题目逐条）
+--------------------------------------------------------------------
+D1 基线复现：3DGS 7k → coarse SuGaR 15k → mesh(.ply 可打开)，含可视化；记录命令、commit、环境、seed、迭代数、墙钟、路径。
+D2 代码改动：进入 coarse SuGaR 训练 loss（深度-法向一致性），有动机、有假设、非注释性改动。
+D3 对照实验：baseline、λ=0.05、λ=0.2 三组，每组完整重跑 coarse 训练 + mesh 提取（3DGS 共用同一 7k ckpt，公平）。
+D4 结果分析：几何指标（COLMAP 稀疏点→mesh 距离、Chamfer 近似、网格拓扑统计/连通分量/漂浮碎片）
+   + 渲染指标（测试视角 PSNR/SSIM/LPIPS）+ 对比图（渲染 + 误差图 + 网格法向图）+ 失败案例 + 代价分析。
+D5 report.pdf（中文，outputs/reports/report.pdf）。
+D6 GitHub 公开仓库：改动代码、复现脚本（含三组对照命令）、小型结果（指标 CSV、图），不含权重/数据。
+D7 环境记录：notes/ENV.md（OS、Python、torch、CUDA、GPU、关键依赖版本）。
+
+--------------------------------------------------------------------
+2. 改动设计（预注册，已定稿；执行者不得改假设）
+--------------------------------------------------------------------
+名称：深度-法向一致性正则（Depth-Normal Consistency, DNC），加入 sugar_trainers/coarse_density.py 训练循环。
+思路来源（报告中必须引用）：Huang et al., "2D Gaussian Splatting for Geometrically Accurate Radiance Fields", SIGGRAPH 2024
+  提出的 depth-normal consistency loss。本工作把它移植到 SuGaR 的 coarse 阶段，属于借鉴已发表思路 + 自行实现，
+  不复制任何 2DGS 代码。
+自己的贡献点（报告要写清）：
+  P1 移植到 SuGaR 的 3D 椭球表示：法向取最短 scale 轴（2DGS 是 2D 圆盘的固有法向），需处理法向朝向歧义；
+  P2 与 SuGaR 原有 SDF 法向损失（sdf_better_normal_loss，采样点级别）的叠加分析：DNC 是像素级、跨高斯的约束，
+     两者是否冗余/冲突要用实验回答；
+  P3 λ 敏感性分析 + 失败案例（背景/天空/边缘）。
+动机：SuGaR 用 SDF/density 正则把高斯压扁贴面，但每个高斯的法向只受采样点级别的 SDF 约束，相邻高斯法向可能互相
+      不一致，导致 Poisson 输入法向噪声大、网格出现褶皱与漂浮碎片。让渲染法向图与渲染深度图的几何法向一致，
+      可在像素尺度上强制相邻高斯共面。
+实现（在 iteration > 9000（与 SDF 正则同期）时，每次迭代）：
+  (a) 用现有 sugar.render_image_gaussian_rasterizer(point_colors=...) 渲染两张图：
+      深度图 D（point_colors = 相机坐标 z；coarse_density.py 585–611 行已有此写法，直接复用，背景填 max_depth），
+      法向图 N（point_colors = 每个高斯的世界系法向 = 最小 scale 轴经四元数旋转后的单位向量，逐高斯翻转符号使其
+      朝向相机；渲染后在像素上再归一化）。
+  (b) 用相机内参把 D 反投影成相机系点云 P(u,v)，用相邻像素中心差分 ∂P/∂u × ∂P/∂v 得几何法向 N_d，归一化，
+      再用相机外参旋转到世界系（或反过来把 N 转到相机系，二选一，但必须同一坐标系）。
+  (c) 有效像素掩码：D < 0.98·max_depth（排除未命中背景）；剔除图像边缘 2 像素；剔除深度梯度极大的像素
+      （|∂D| > 相对阈值，跨物体边界）。
+  (d) L_dnc = mean_valid( 1 − |cos(N, N_d)| )（绝对值消除符号歧义）。
+  (e) loss += λ · L_dnc，λ 由新命令行参数 --dnc_factor 控制，默认 0.0；λ==0 时完全不进入 DNC 分支（不渲染 N、D），
+      保证 baseline 代码路径与原版一致。
+  (f) 每 100 iter 把 L_dnc 打进日志；每 1000 iter 保存 D / N / N_d / mask 的 PNG 到 run 目录（PIL）。
+  (g) 新增 --dnc_start（默认 9000）便于冒烟测试，不改其他默认值。
+可检验假设：
+  H1（几何）：λ>0 时，mesh 碎片连通分量数 ↓，COLMAP 稀疏点→mesh 距离中位数 ↓，网格法向更平滑。
+  H2（渲染代价）：测试视角 PSNR 变化在 ±0.5 dB 内；若下降更多，如实报告为代价。
+  H3（叠加关系）：DNC 与原有 SDF 法向损失不冲突（训练中两者同时下降；若 L_dnc 不降或 SDF 法向损失上升，报告冲突）。
+超参：λ ∈ {0.05, 0.2}（两个取值）。三组 run 命名：coarse_baseline / coarse_dnc005 / coarse_dnc02。
+可选加分（仅当 09:00 前三组已完成且验收通过）：λ=0.2 + 2DGS 深度失真损失，作为第四组；或在 T&T 的 train 场景
+  跑 baseline vs 最佳 λ 做泛化检查。这两项都不进入硬性交付，由 Fable 决定是否启动。
+预期失败案例（报告要展示）：远景/天空深度差分法向噪声大 → 拉坏背景；物体边缘像素跨边界差分产生伪法向；
+  细结构（Truck 的栏杆、天线）可能被过度平滑。
+备选方案 B（仅当 DNC 实现在 60 分钟内跑不通时启用，须先向 Fable 报告）：
+  改 sugar_extractors/coarse_mesh.py 的 Poisson 前主流程：对表面采样点做 kNN 法向一致性过滤
+  （剔除与 16 近邻平均法向夹角 > θ 的点，θ ∈ {30°, 60°}），同样是"进入 mesh 提取主流程"的改动。
+
+--------------------------------------------------------------------
+2b. 评测方案（数据集 + 指标定义，预注册）
+--------------------------------------------------------------------
+数据集：Tanks & Temples 的 Truck（来源：3DGS 官方打包 tandt_db.zip，含 COLMAP 稀疏重建 sparse/0）。
+  规模：251 张图像，原始分辨率约 980×546（执行者在 ENV.md 里填实测值）。
+  划分：3DGS 的 --eval 规则（llffhold=8：索引 %8==0 为测试）→ 32 张测试 / 219 张训练。三组 run 与 mesh 提取均用同一划分。
+  3DGS 训练分辨率：3DGS 默认（宽 >1600 才降采样，Truck 不会降），三组一致。
+  可选泛化场景：T&T 的 train（同 zip 内），仅在时间富余时跑。
+所有指标由 $PROJ_ROOT/scripts/eval/ 下的脚本统一计算，输出到 outputs/metrics/，汇总到 summary.csv。
+渲染指标（在 32 张测试视角上，用 coarse SuGaR 15k 的高斯渲染；另报 vanilla 3DGS 7k 作参考行）：
+  M1 PSNR（dB，↑）：3DGS 官方定义（逐图 MSE 取 -10log10，再对视角求均值）。
+  M2 SSIM（↑）：gaussian_splatting/utils/loss_utils.ssim（11×11 高斯窗）。
+  M3 LPIPS-VGG（↓）：gaussian_splatting/lpipsPyTorch；VGG 权重下载失败则只报 M1/M2 并注明。
+几何指标（Truck 无真值网格，用 COLMAP 稀疏点作为独立几何参考；对三组 mesh 用完全相同的 surface_level=0.3、
+  decimation=200k 提取后计算）：
+  G1 稀疏点→mesh 距离（↓）：取 COLMAP points3D 中 track 长度 ≥3 且落在前景 bbox 内的点，用 open3d
+     RaycastingScene.compute_distance 算点到网格表面的无符号距离；报 mean / median / P90，单位为场景单位并同时除以
+     相机空间尺度（sugar.get_cameras_spatial_extent()）给出相对值。
+  G2 精度比例（↑）：G1 距离 < τ 的点占比，τ = 相机空间尺度的 0.5% 与 1%。
+  G3 mesh 顶点→稀疏点最近距离 mean（↓，Chamfer 另一半，scipy cKDTree）；因稀疏点本身稀疏，只作参考并注明局限。
+  G4 拓扑统计：顶点数、面数、连通分量数、最大分量面数占比（↑）、面数<100 的碎片分量数（↓，"漂浮碎片"），
+     非流形边数、边界边数（open3d TriangleMesh 的 cluster_connected_triangles / get_non_manifold_edges）。
+  G5 法向平滑度：相邻面二面角的均值与 P90（度，↓表示更平滑；过度平滑会吞掉细节，需结合图判断）。
+训练代价指标：coarse 训练总墙钟（min）、每迭代平均耗时（ms）、峰值显存（torch.cuda.max_memory_allocated）、
+  15k 时高斯数量。
+可视化（三组并排，固定 4 个测试视角，视角索引由执行者选定并写进脚本）：
+  V1 渲染图 + 与 GT 的 |误差| 热图（带色条）；
+  V2 mesh 法向着色图（pytorch3d MeshRasterizer 渲染，headless）；
+  V3 DNC 中间量（D、N、N_d、mask）；
+  V4 失败案例特写（背景/边缘/细结构）。
+指标方向与单位在 summary.csv 表头注明；报告中的所有数字只能来自 summary.csv 与 metrics JSON。
+
+--------------------------------------------------------------------
+3. 阶段划分、命令、验收标准、时间预算
+--------------------------------------------------------------------
+通用约定：
+- 所有命令在 repo/SuGaR 下、ML venv 中执行；所有长任务 nohup + 日志到 $PROJ_ROOT/logs/<名字>.log，记录起止时间（date）。
+- 所有产出到 $PROJ_ROOT/outputs/ 与 repo/SuGaR/output/（后者是 SuGaR 默认输出，最后同步关键小文件到 outputs/）。
+- 随机种子：3DGS 的 safe_state 固定 seed 0；coarse 训练脚本开头补 torch.manual_seed(0)/np.random.seed(0)/random.seed(0)
+  （这是为可复现性的小改动，与 DNC 改动分开记录）。CUDA 光栅化本身非确定，报告中注明。
+- 环境变量：写 $PROJ_ROOT/env.sh（按 CLAUDE.md §4 模板），每个 shell 先 source。
+- 执行者每阶段结束写 notes/SELF_CHECK_阶段N.md（验收条目 + 实际值 + PASS/FAIL），不 commit、不删文件、不改假设。
+
+===== 阶段 1：环境（预算 35 min，目标 06:20 前完成）=====
+命令要点：
+  pip install torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1 --retries 10 --timeout 60
+  写 $VIRTUAL_ENV/constraints.txt（torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1）并 export PIP_CONSTRAINT
+  pip install ninja
+  wget 到 wheels/：https://dl.fbaipublicfiles.com/pytorch3d/packaging/wheels/py310_cu121_pyt241/pytorch3d-0.7.8-cp310-cp310-linux_x86_64.whl
+  pip install --no-deps wheels/pytorch3d-*.whl ；pip install fvcore iopath（pytorch3d 运行时依赖）
+  pip install open3d plyfile rich tqdm plotly scipy scikit-learn pymcubes（若 pymcubes 编译失败可跳过，非必需）
+  cd gaussian_splatting/submodules/diff-gaussian-rasterization && TORCH_CUDA_ARCH_LIST="9.0" pip install --no-build-isolation --no-deps . ；simple-knn 同理
+  （注意：这两个扩展必须在 SuGaR 自带的子模块目录编译，不要 pip 装 PyPI 上的同名包）
+验收（Fable 独立复跑）：
+  A1 python -c "import torch;print(torch.__version__, torch.version.cuda, torch.cuda.is_available())" → 2.4.1+cu121 / 12.1 / True
+  A2 pytorch3d: from pytorch3d.ops import knn_points 在 cuda 上真跑一次 → 输出形状正确
+  A3 diff_gaussian_rasterization / simple_knn 可 import，且 3DGS 训练 20 iter 冒烟通过（A4 覆盖）
+  A4 数据：用 python zipfile 解压 tandt_db.zip 到 data/（不要用 unzip，本机没有）；data/tandt/truck/images 有 251 张，sparse/0 存在
+  A5 notes/ENV.md 写好（含 nvidia-smi、pip freeze 摘录、commit 哈希）
+回退：任一步 >15 min 卡住 → 报告 Fable；pytorch3d 若 wheel 装不上则源码编译（ninja + TORCH_CUDA_ARCH_LIST=9.0，约 20 min），同时不阻塞 3DGS 训练。
+
+===== 阶段 2：基线流水线（预算 50 min，目标 07:15 前完成）=====
+  S2.1 3DGS 7k：
+    python gaussian_splatting/train.py -s $PROJ_ROOT/data/tandt/truck -m $PROJ_ROOT/outputs/baseline/gs_truck \
+        --iterations 7000 --save_iterations 7000 --test_iterations 7000 --eval
+    （若 3DGS 子模块的 train.py 没有 --save_iterations 默认含 7000，须显式给；确认 point_cloud/iteration_7000/point_cloud.ply 生成）
+  S2.2 coarse SuGaR baseline（GPU0）：
+    python train_coarse_density.py -s $PROJ_ROOT/data/tandt/truck -c $PROJ_ROOT/outputs/baseline/gs_truck -i 7000 \
+        -o $PROJ_ROOT/outputs/runs/coarse_baseline --eval True --gpu 0 --dnc_factor 0   （dnc_factor 在阶段 3 加入前先不传）
+  S2.3 mesh 提取 baseline：
+    python extract_mesh.py -s ... -c ... -i 7000 -m <coarse .pt> -l 0.3 -d 200000 --eval True --gpu 0 -o $PROJ_ROOT/outputs/runs/mesh_baseline
+  S2.4 记录每步墙钟（date 前后）、命令、输出路径到 notes/RUNLOG.md。
+验收：
+  B1 point_cloud/iteration_7000/point_cloud.ply 存在，3DGS 日志末尾有 7000 iter 的 test PSNR（Fable 抽查数值）
+  B2 coarse 输出 .pt 存在，日志显示到 15000 iter，出现 "Starting SDF regularization"
+  B3 mesh .ply 存在，Fable 用 open3d 独立读取：顶点数 >0、三角形数 ≈ 200k（decimation 目标）、无 NaN
+  B4 outputs/baseline/ 下留档 baseline 三步产物的索引（路径清单）
+  B5 三步总墙钟记录在 RUNLOG.md
+熔断：07:30 若 S2.2 还没跑到 15k → Fable 决定是否把 coarse 减到 12k（三组统一）。
+
+===== 阶段 3：改动实现 + 三组对照（预算 100 min，目标 09:00 前完成）=====
+  与阶段 2 的 S2.2/S2.3 并行：执行者在 S2.2 跑的同时实现 DNC（§2）。
+  S3.1 【并行执行者 2】在 repo/SuGaR_dev（cp -a repo/SuGaR 而来，排除 output/）中实现，不碰正在跑 baseline 的 repo/SuGaR；
+       用 git diff 留痕（不 commit）。验收通过后由 Fable 把 diff 应用到 repo/SuGaR 并 commit 到分支 dnc。
+  S3.2 实现 --dnc_factor（train_coarse_density.py 参数 + coarse_density.py 训练循环）；写一个 20-iter 冒烟脚本
+       scripts/smoke_dnc.sh（从 9001 迭代附近直接触发，可临时把 start 改成参数），确认 loss 有限、梯度回传、显存正常。
+  S3.3 保存 DNC 中间可视化：训练中每 1000 iter 保存一张 (D, N, N_d, 有效掩码) 的 PNG 到 run 目录（PIL 即可），用于报告。
+  S3.4 运行：coarse_dnc005 (λ=0.05, GPU1)、coarse_dnc02 (λ=0.2, GPU0 在 baseline 结束后)；随后各自 extract_mesh，参数与 baseline 完全一致。
+  S3.5 若 baseline 代码路径被触及（dnc_factor=0 时），须证明 dnc_factor=0 不进入 DNC 分支（代码审查 + 日志无 L_dnc 行）。
+验收：
+  C1 git diff（repo/SuGaR vs repo.baseline）非空且仅涉及：train_coarse_density.py、sugar_trainers/coarse_density.py、
+     必要的 sugar_scene/sugar_model.py 辅助函数、新增 scripts/；Fable 逐行审阅 DNC 数学（差分方向、坐标系、掩码）。
+  C2 Fable 独立小脚本：给一个平面高斯集合构造合成深度图，验证 N_d 计算返回正确法向（cos>0.99）。
+  C3 三组 coarse .pt 与 mesh .ply 齐全，日志墙钟记录齐全；λ 组日志有 L_dnc 数值且随训练下降或稳定。
+  C4 三组用同一 3DGS ckpt、同一 seed、同一 extract 参数（Fable 从 RUNLOG 与日志头部核对）。
+
+===== 阶段 4：评测 + 图（预算 60 min，目标 10:00 前完成）=====
+  【并行执行者 3】评测脚本放 $PROJ_ROOT/scripts/eval/，环境就绪后先在 baseline 产物上跑通。
+  S4.1 渲染指标脚本 scripts/eval/eval_render.py：加载 coarse .pt，对 32 张测试视角渲染，算 PSNR/SSIM/LPIPS
+       （SSIM 用 gaussian_splatting/utils/loss_utils.ssim；LPIPS 用 gaussian_splatting/lpipsPyTorch，VGG 权重下载到 TORCH_HOME），
+       输出 outputs/metrics/render_<run>.csv（逐视角）+ 汇总 JSON；同时保存 4 个固定测试视角的渲染 PNG 与 |误差| 热图 PNG。
+  S4.2 几何指标脚本 scripts/eval/eval_geometry.py（指标定义见 §2b G1–G5）：读 COLMAP sparse/0/points3D.bin（用 3DGS 自带 read_write_model），
+       计算 (i) 稀疏点→mesh 距离（open3d RaycastingScene.compute_distance）的 mean/median/P90 及 <τ 比例（τ 取场景尺度的 1%）；
+       (ii) mesh 顶点→稀疏点最近距离 mean（Chamfer 另一半，kNN 用 scipy cKDTree）；
+       (iii) 拓扑：顶点数、面数、连通分量数、最大分量面数占比、面数<100 的碎片分量数、非流形边数、边界边数。
+       输出 outputs/metrics/geometry_<run>.json。
+  S4.3 mesh 可视化：用 pytorch3d MeshRasterizer 从 4 个固定测试视角渲染 mesh 的法向着色图与深度图（headless 可用），
+       存 PNG；三组并排。
+  S4.4 汇总表 outputs/metrics/summary.csv（行=run，列=全部指标 + 训练墙钟 + 高斯数）。
+  S4.5 图表由 Fable 指定的脚本在 tools/doc_env 中生成（matplotlib，中文字体 assets/fonts），存 outputs/figures/：
+       fig1 指标柱状/折线（三组）、fig2 渲染对比+误差图拼图、fig3 mesh 法向图拼图、fig4 失败案例特写、fig5 DNC 中间量可视化。
+验收：
+  E1 Fable 用独立脚本对 baseline 的 PSNR（至少 3 个视角）与几何距离中位数复算，与 CSV 一致（PSNR 差 <0.01 dB，距离差 <1%）。
+  E2 summary.csv 无缺失；指标方向解释正确（越低越好/越高越好标明）。
+  E3 图片打开检查（Fable 亲眼看）：无中文方框、对比图有标注、误差图有色条。
+
+===== 阶段 5：报告 + 仓库（预算 55 min，目标 11:00 前完成；10:50 后不改核心代码）=====
+  S5.1 report：用 tools/doc_env 生成 DOCX（python-docx，抄 scripts/deliverables/create_chinese_smoke_test.py 的写法）
+       → libreoffice.sh 转 PDF → validate_artifacts.py 验收 → Fable 看逐页预览。
+       章节：摘要 / 环境与数据（来源、划分 219 train / 32 test、分辨率）/ 复现流程与命令（commit、seed、迭代、墙钟）/
+       改动动机与实现（含公式与 diff 摘要）/ 实验设置与对照 / 结果（表 + 图）/ 失败案例与代价 / 结论与下一步 / 附录（完整命令、日志路径）。
+       诚信条款：所有数字来自 summary.csv；没跑出来的标"未完成"，不得编造。
+  S5.2 GitHub：在 repo/SuGaR 内（基于官方 commit）新建分支 dnc，Fable 验收后 commit（含 scripts/、README_ZH.md 复现步骤、
+       results/summary.csv、figures 小图；.gitignore 排除 output/、*.pt、*.ply>10MB、data）；push 到用户提供的空仓库；
+       report.pdf 同时放仓库根目录。
+验收：
+  F1 report.pdf 逐页预览通过（中文占比、无越界、图清晰），数字与 summary.csv 抽查一致（≥5 个数）。
+  F2 仓库 README 的命令能对应到 RUNLOG.md；仓库不含数据/权重；git log 起点是官方 commit 7c10c4a。
+  F3 交付清单：report.pdf 路径 + GitHub URL + 环境记录 + 日志目录。
+
+--------------------------------------------------------------------
+3c. 突发事件记录与改期（07:57 追加）
+--------------------------------------------------------------------
+- 06:49 前一个 PBS 作业 walltime 到期被强杀：coarse_base_seed0（训练+mesh）已完成；coarse_dnc005 / coarse_dnc02 跑到
+  14900/15000 时被杀，未产出 15000.pt（SuGaR 不存中间 ckpt）。残缺目录与日志改名为 *_killed_0649 保留作失败记录。
+- 新作业 614430（hopper-13）只有 1×H200。改为顺序重跑：07:57 启动 coarse_dnc02（独占 GPU0，含 mesh），随后 coarse_dnc005。
+  脚本 scripts/run_s34_seq_1gpu.sh，日志 logs/s34_seq_1gpu.log。
+- 08:00 Fable 已对 coarse_base_seed0 跑评测：PSNR 24.620 / SSIM 0.8555 / LPIPS 0.2032；G1 median 0.004019；分量 2233 / 碎片 2137。
+  与未打补丁 coarse_baseline（24.653 / 0.004003 / 2237 / 2147）一致（差异在 CUDA 非确定范围内）→ 证明 λ=0 代码路径未变。
+- 08:33 事故：coarse_dnc005 训练完成（13.9 min），但 mesh 提取未执行——执行者 7 编辑 run_s34_one.sh 时 bash 正在读取它
+  （"error reading input file"）。处理：执行者 6 手动补跑 mesh_dnc005 + 评测；教训：不得编辑正在运行的脚本，改动写新文件。
+- 08:45 追加对照组 coarse_official_dnc（官方 dn_consistency，λ=0.05，执行者 8），排在 detach 组之后。
+- 08:50 新方案交付：plans/新方案_A100四卡_SuGaR改进.md（给另一台 4×A100 机器的 Fable）。
+- 新时间表：09:00 两组 λ 训练+mesh+评测完成 → 09:40 图表与报告初稿 → 10:30 报告定稿 + GitHub push → 11:00 交付。
+
+--------------------------------------------------------------------
+3d. 预注册追加实验：λ=0.2 退化诊断（08:25 追加，Fable 决策）
+--------------------------------------------------------------------
+观察（首轮被杀组与单卡重跑组一致复现）：λ=0.2 时渲染深度图退化为无场景结构的光滑曲面，法向图近单色，
+  有效像素比例 98%；训练总损失 0.26–0.32（λ=0 组末期约 0.09），不透明度均值降到 0.45、分布双峰。
+机理假设 H4：L_dnc 的梯度同时流经深度 D 与法向 N，"把渲染深度抹平"是 L_dnc 的平凡解，λ 大时压过光度项。
+预注册修复：新增 --dnc_detach_depth（默认 False，不影响已跑三组）；为 True 时 N_d 由 D.detach() 计算，
+  梯度只经法向 N 回传（N 向几何法向对齐，而几何不被 DNC 项直接改动）。
+第四组 run：coarse_dnc02_detach（λ=0.2, detach）；命令与三组一致，只多 --dnc_detach_depth True。
+可检验预测：P1 深度图保留场景结构（dnc_vis 肉眼可判）；P2 PSNR 回到 λ=0 组 ±0.5 dB；
+  P3 L_dnc 仍下降但末值高于 0.046（不再靠抹平深度取得低值）；P4 几何指标相对 λ=0 组的变化方向用于回答 H1。
+时间：等 coarse_dnc005 链完成后立即启动，预计 09:15 训练+mesh 完成，09:20 评测完成。若 09:30 未完成则放弃，报告只写诊断。
+
+--------------------------------------------------------------------
+4. 时间表（硬检查点）
+--------------------------------------------------------------------
+05:40 计划提交 → 用户批准
+06:20 环境验收通过（A1–A5）
+07:15 baseline 三步全通（B1–B5）      ★ 若 07:45 未通，降级：coarse 12k / decimation 200k 不变
+09:00 三组对照跑完（C1–C4）
+10:00 指标与图完成（E1–E3）
+11:00 report.pdf + GitHub 完成（F1–F3）
+11:00–11:20 机动缓冲，只做文档核对，不动代码
+
+--------------------------------------------------------------------
+5. 风险与回退
+--------------------------------------------------------------------
+R1 pytorch3d wheel 与 torch 2.4.1 ABI 不匹配 → 源码编译（ninja，20 min）；期间 3DGS 训练不受影响（不依赖 pytorch3d）。
+R2 diff-gaussian-rasterization 编译报 glm 缺失 → git submodule update --init --recursive。
+R3 coarse SuGaR 显存/时间超预期 → 降 n_samples_for_sdf_regularization（三组统一）或减到 12k iter。
+R4 DNC 实现超时 → 备选方案 B（mesh 提取 kNN 法向过滤），仍满足"进入主流程 + 超参两取值"。
+R5 open3d 无显示环境 → 只用其几何 API，不用 visualizer；mesh 渲染走 pytorch3d。
+R6 lpips VGG 权重下载失败 → 报告只报 PSNR/SSIM，注明原因。
+R7 PBS walltime 不足 → 用户在登录节点续作业；所有中间产物在 /scratch，可断点续。
+
+--------------------------------------------------------------------
+6. Checklist（每阶段更新）
+--------------------------------------------------------------------
+✅ 阶段 0：计划批准（06:05，含方案 A 与评测方案）；GitHub 仓库 https://github.com/Find-Yit/sugar-dnc-zju.git；walltime 待用户确认
+✅ 阶段 1：环境 A1–A5（执行者自检 PASS，05:49 完成；Fable 复核 torch/pytorch3d import 与单元测试在该环境跑通）
+✅ 阶段 2：基线 B1–B5 PASS（06:11 完成，三步墙钟 2m13s + 12m44s + 6m22s）；Fable 独立核对 3DGS test PSNR 23.9087、mesh V=205,647 F=370,438
+   勘误：-d 200000 实际是 fg/bg 各 20 万三角形的目标（非顶点），合并后 ≈37 万面属正常；三组统一沿用即可。
+   baseline 碎片分量（<100 面）= 2,147，连通分量 2,237，作为 H1 参照值。
+🔶 阶段 3：C1 diff 审阅通过、C2 Fable 盲验通过（5 个随机平面 loss≈1e-8、错误法向 loss 与解析值一致到 1e-5）；S3.4 三组正式 run 06:35 启动（执行者 4）
+   决策记录：阶段 2 未打补丁的 baseline 保留为留档；正式对照三组统一用打补丁代码 + seed 0（coarse_base_seed0 / coarse_dnc005 / coarse_dnc02），未打补丁 baseline 与 λ=0 的指标对比可额外证明 λ=0 代码路径未变。
+   执行者 2 新增掩码条件 ‖N_raw‖>0.1（合成后低不透明度像素保护）：Fable 接受，记入报告。
+🔶 阶段 4：评测脚本就绪（执行者 3，07:00）；E1 Fable 独立复算 baseline PASS：4 视角 PSNR 从 PNG 重算差 ≤0.003 dB；G1 median 0.004003 / 分量 2237 / 碎片 2147 与我自写 open3d 脚本逐位一致。三组指标与图待 run 完成
+   执行者 3 备注：cameras.json 内参为 COLMAP 原分辨率，SuGaR 包装器换算后 3DGS 7k PSNR 23.9003 vs 官方日志 23.9087（差 0.008 dB，报告注明）；G3 用前景顶点版本。
+🔶 阶段 5：骨架（图表脚本、报告生成脚本、仓库脚手架）执行者 5 于 07:05 启动

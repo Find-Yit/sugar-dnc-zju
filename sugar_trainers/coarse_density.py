@@ -1,4 +1,6 @@
 import os
+import json      # [STATS] training-cost record
+import random    # [REPRO] reproducibility seeding
 import numpy as np
 import torch
 import open3d as o3d
@@ -9,6 +11,7 @@ from sugar_scene.sugar_model import SuGaR
 from sugar_scene.sugar_optimizer import OptimizationParams, SuGaROptimizer
 from sugar_scene.sugar_densifier import SuGaRDensifier
 from sugar_utils.loss_utils import ssim, l1_loss, l2_loss
+from sugar_utils import dnc_utils  # [DNC] depth-normal consistency helpers
 
 from rich.console import Console
 import time
@@ -16,6 +19,20 @@ import time
 
 def coarse_training_with_density_regularization(args):
     CONSOLE = Console(width=120)
+
+    # ====================[REPRO] Reproducibility====================
+    # Fix every RNG at the very beginning of the trainer so that the image shuffling,
+    # the SDF point sampling and the densification are identical across runs.
+    # (The CUDA rasterizer itself is not bit-wise deterministic; this is documented
+    #  in the report.)  This block is independent from the DNC change below.
+    seed = int(getattr(args, 'seed', 0))
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    CONSOLE.print(f"[REPRO] random / numpy / torch seeded with {seed}.")
+
+    func_t0 = time.time()  # [STATS] wall clock of the whole function (setup included)
 
     # ====================Parameters====================
 
@@ -241,6 +258,28 @@ def coarse_training_with_density_regularization(args):
     
     sdf_estimation_factor = args.estimation_factor
     sdf_better_normal_factor = args.normal_factor
+
+    # -----[SMOKE] Optional override of the total number of iterations-----
+    # Used only by scripts/smoke_dnc.sh; the three reported runs keep the default 15000.
+    if getattr(args, 'num_iterations', None) is not None:
+        num_iterations = int(args.num_iterations)
+        CONSOLE.print(f"[SMOKE] num_iterations overridden to {num_iterations}.")
+
+    # -----[DNC] Depth-Normal Consistency regularization parameters-----
+    dnc_factor = float(getattr(args, 'dnc_factor', 0.0))
+    dnc_start = int(getattr(args, 'dnc_start', 9000))
+    dnc_depth_grad_rel_thresh = float(getattr(args, 'dnc_depth_grad_rel_thresh', 0.05))
+    dnc_border = int(getattr(args, 'dnc_border', 2))
+    dnc_min_normal_norm = float(getattr(args, 'dnc_min_normal_norm', 0.1))
+    # [DNC][DETACH] If True, N_d is built from D.detach(): the DNC gradient reaches the
+    # Gaussians only through the normal map N, so "flattening the rendered depth" (the
+    # trivial minimiser of L_dnc) is no longer reachable by this term.
+    dnc_detach_depth = bool(getattr(args, 'dnc_detach_depth', False))
+    dnc_vis_every = int(getattr(args, 'dnc_vis_every', 1000))
+    dnc_log_every = int(getattr(args, 'dnc_log_every', 100))
+    # lambda == 0 -> the DNC branch is never entered, so the baseline code path is
+    # byte-for-byte the original SuGaR one (no extra rendering, no extra loss term).
+    use_dnc_regularization = dnc_factor > 0.
     
     sugar_checkpoint_path = f'sugarcoarse_3Dgs{iteration_to_load}_densityestimXX_sdfnormYY/'
     sugar_checkpoint_path = os.path.join(args.output_dir, sugar_checkpoint_path)
@@ -265,6 +304,13 @@ def coarse_training_with_density_regularization(args):
     CONSOLE.print("Output directory:", args.output_dir)
     CONSOLE.print("SDF estimation factor:", sdf_estimation_factor)
     CONSOLE.print("SDF better normal factor:", sdf_better_normal_factor)
+    CONSOLE.print("[DNC] Depth-normal consistency factor:", dnc_factor,
+                  "(enabled)" if use_dnc_regularization else "(DISABLED - original SuGaR path)")
+    CONSOLE.print("[DNC] Depth-normal consistency start iteration:", dnc_start)
+    CONSOLE.print("[DNC] Detach depth for N_d:", dnc_detach_depth,
+                  "(gradient only through the normal map N)" if dnc_detach_depth
+                  else "(gradient through both D and N - original DNC behaviour)")
+    CONSOLE.print("[SMOKE] Total number of iterations:", num_iterations)
     CONSOLE.print("Eval split:", use_eval_split)
     CONSOLE.print("White background:", use_white_background)
     CONSOLE.print("---------------------------")
@@ -472,6 +518,28 @@ def coarse_training_with_density_regularization(args):
     if initialize_from_trained_3dgs:
         iteration = 7000 - 1
     
+    # -----[DNC] Per-run state for the depth-normal consistency regularization-----
+    dnc_ndc_grid = None            # cached (x_ndc, y_ndc) pixel grid
+    dnc_last_loss = None           # last L_dnc value (detached tensor)
+    dnc_last_valid_ratio = None
+    dnc_sdf_normal_value = None    # last sdf_better_normal_loss, logged next to L_dnc (H3)
+    dnc_sdf_estim_value = None     # last sdf_estimation_loss
+    dnc_vis_dir = os.path.join(args.output_dir, 'dnc_vis')
+    dnc_log_csv = os.path.join(args.output_dir, 'dnc_log.csv')
+    if use_dnc_regularization:
+        os.makedirs(args.output_dir, exist_ok=True)
+        os.makedirs(dnc_vis_dir, exist_ok=True)
+        with open(dnc_log_csv, 'w') as _f:
+            _f.write('iteration,l_dnc,dnc_factor,valid_pixel_ratio,total_loss,'
+                     'sdf_better_normal_loss,sdf_estimation_loss,n_gaussians\n')
+        CONSOLE.print(f"[DNC] Visualizations -> {dnc_vis_dir}")
+        CONSOLE.print(f"[DNC] Per-iteration log -> {dnc_log_csv}")
+
+    # -----[STATS] Training-cost bookkeeping (recorded for every run, DNC or not)-----
+    torch.cuda.reset_peak_memory_stats(device)
+    train_wallclock_t0 = time.time()
+    first_iteration = iteration + 1
+
     for batch in range(9_999_999):
         if iteration >= num_iterations:
             break
@@ -691,6 +759,7 @@ def coarse_training_with_density_regularization(args):
                                             loss = loss + sdf_estimation_factor * sdf_estimation_loss.mean()
                                         else:
                                             raise ValueError(f"Unknown sdf_estimation_mode: {sdf_estimation_mode}")
+                                        dnc_sdf_estim_value = sdf_estimation_loss.mean().detach()  # [DNC] log only
 
                                     if enforce_samples_to_be_on_surface:
                                         if squared_samples_on_surface_loss:
@@ -728,9 +797,115 @@ def coarse_training_with_density_regularization(args):
                                     sdf_better_normal_loss = (samples_gaussian_normals - (normal_weights[..., None] * closest_gaussian_normals).sum(dim=-2)
                                                               ).pow(2).sum(dim=-1)  # Shape is (n_samples,)
                                     loss = loss + sdf_better_normal_factor * sdf_better_normal_loss.mean()
+                                    dnc_sdf_normal_value = sdf_better_normal_loss.mean().detach()  # [DNC] log only
                             else:
                                 CONSOLE.log("WARNING: No gaussians available for sampling.")
-                                
+
+                # ==========[DNC] Depth-Normal Consistency regularization==========
+                # Motivation: SuGaR only constrains Gaussian normals through sample-level SDF
+                # losses, so neighbouring Gaussians may still disagree, which injects noise in
+                # the normals fed to the Poisson reconstruction.  Following the depth-normal
+                # consistency loss of 2D Gaussian Splatting (Huang et al., SIGGRAPH 2024), we
+                # additionally require, at the *pixel* level, that the rendered Gaussian normal
+                # map agrees with the geometric normal of the rendered depth map.
+                # Port to SuGaR's 3D ellipsoids: the per-Gaussian normal is the smallest-scale
+                # axis (sugar.get_normals), whose sign is ambiguous, hence (i) a per-Gaussian
+                # flip towards the camera before rasterization and (ii) an absolute value in
+                # the cosine.  Conventions: see sugar_utils/dnc_utils.py.
+                if use_dnc_regularization and iteration > dnc_start:
+                    if iteration == dnc_start + 1:
+                        CONSOLE.print("\n---INFO---\nStarting depth-normal consistency (DNC) "
+                                      f"regularization, factor={dnc_factor}.")
+                    dnc_fov_camera = nerfmodel.training_cameras.p3d_cameras[camera_indices.item()]
+                    dnc_w2v = dnc_fov_camera.get_world_to_view_transform()
+
+                    # (a.1) Render the depth map D: per-Gaussian colour = view-space z,
+                    #       background filled with max_depth (same recipe as the SDF branch above).
+                    dnc_point_depth = dnc_w2v.transform_points(sugar.points)[..., 2:].expand(-1, 3)
+                    dnc_max_depth = dnc_point_depth.max().detach()
+                    dnc_depth = sugar.render_image_gaussian_rasterizer(
+                        camera_indices=camera_indices.item(),
+                        bg_color=dnc_max_depth + torch.zeros(3, dtype=torch.float, device=sugar.device),
+                        sh_deg=0,
+                        compute_color_in_rasterizer=False,
+                        compute_covariance_in_rasterizer=True,
+                        return_2d_radii=False,
+                        use_same_scale_in_all_directions=False,
+                        point_colors=dnc_point_depth,
+                    )[..., 0]
+
+                    # (a.2) Render the normal map N: per-Gaussian colour = the smallest-scale
+                    #       axis, flipped towards the camera, expressed in view space.
+                    #       (rotation is linear, so rotating per Gaussian before alpha-compositing
+                    #        is equivalent to rotating the composited map afterwards)
+                    dnc_camera_center = dnc_fov_camera.get_camera_center()
+                    dnc_world_normals = sugar.get_normals(estimate_from_points=False)
+                    dnc_world_normals = dnc_world_normals * torch.sign(
+                        (dnc_world_normals * (dnc_camera_center - sugar.points)).sum(dim=-1, keepdim=True)
+                    ).detach()
+                    dnc_view_normals = dnc_w2v.transform_normals(dnc_world_normals)
+                    dnc_normal_img = sugar.render_image_gaussian_rasterizer(
+                        camera_indices=camera_indices.item(),
+                        bg_color=torch.zeros(3, dtype=torch.float, device=sugar.device),
+                        sh_deg=0,
+                        compute_color_in_rasterizer=False,
+                        compute_covariance_in_rasterizer=True,
+                        return_2d_radii=False,
+                        use_same_scale_in_all_directions=False,
+                        point_colors=dnc_view_normals,
+                    )
+
+                    # (b, c, d) Unproject D -> view-space point map -> geometric normal N_d,
+                    #           mask out background / borders / depth discontinuities,
+                    #           L_dnc = mean_valid(1 - |cos(N, N_d)|).
+                    if (dnc_ndc_grid is None) or (dnc_ndc_grid[0].shape != dnc_depth.shape):
+                        dnc_ndc_grid = dnc_utils.make_ndc_pixel_grid(
+                            dnc_depth.shape[0], dnc_depth.shape[1], sugar.device)
+                    dnc_fx, dnc_fy, dnc_px, dnc_py = dnc_utils.get_ndc_intrinsics(dnc_fov_camera)
+                    dnc_depth_for_loss = dnc_depth.detach() if dnc_detach_depth else dnc_depth
+                    dnc_loss, dnc_aux = dnc_utils.depth_normal_consistency_loss(
+                        dnc_depth_for_loss, dnc_normal_img,
+                        dnc_fx, dnc_fy, dnc_px, dnc_py,
+                        max_depth=dnc_max_depth,
+                        border=dnc_border,
+                        depth_grad_rel_thresh=dnc_depth_grad_rel_thresh,
+                        min_normal_norm=dnc_min_normal_norm,
+                        x_ndc=dnc_ndc_grid[0], y_ndc=dnc_ndc_grid[1],
+                        return_aux=True,
+                    )
+
+                    # (e) Add the weighted term to the total loss.
+                    loss = loss + dnc_factor * dnc_loss
+                    dnc_last_loss = dnc_loss.detach()
+                    dnc_last_valid_ratio = dnc_aux['valid_ratio'].detach()
+
+                    # (f) Logging every dnc_log_every iterations, PNG dumps every dnc_vis_every.
+                    if (dnc_log_every > 0) and (iteration % dnc_log_every == 0):
+                        with torch.no_grad():
+                            _l_dnc = dnc_last_loss.item()
+                            _vr = dnc_last_valid_ratio.item()
+                            _tot = loss.detach().item()
+                            _sdfn = float(dnc_sdf_normal_value.item()) if dnc_sdf_normal_value is not None else float('nan')
+                            _sdfe = float(dnc_sdf_estim_value.item()) if dnc_sdf_estim_value is not None else float('nan')
+                        CONSOLE.print(f"[DNC] Iteration: {iteration}  L_dnc: {_l_dnc:>7f}  "
+                                      f"lambda*L_dnc: {dnc_factor * _l_dnc:>7f}  "
+                                      f"valid pixels: {_vr:.2%}  total loss: {_tot:>7f}")
+                        with open(dnc_log_csv, 'a') as _f:
+                            _f.write(f"{iteration},{_l_dnc:.8f},{dnc_factor},{_vr:.6f},"
+                                     f"{_tot:.8f},{_sdfn:.8f},{_sdfe:.8f},{sugar.n_points}\n")
+                    if (dnc_vis_every > 0) and (iteration % dnc_vis_every == 0):
+                        with torch.no_grad():
+                            dnc_utils.save_dnc_visualization(
+                                dnc_vis_dir, iteration,
+                                depth=dnc_depth,
+                                normal_pred=dnc_aux['n_pred'],
+                                normal_from_depth=dnc_aux['n_d'],
+                                mask=dnc_aux['mask'],
+                            )
+                        CONSOLE.print(f"[DNC] Saved visualizations for iteration {iteration} "
+                                      f"to {dnc_vis_dir}")
+                # ==========[DNC] end==========
+
             else:
                 loss = 0.
                 
@@ -790,6 +965,9 @@ def coarse_training_with_density_regularization(args):
                     CONSOLE.print("Opacities:", sugar.strengths.min().item(), sugar.strengths.max().item(), sugar.strengths.mean().item(), sugar.strengths.std().item(), sep='   ')
                     if regularize_sdf and iteration > start_sdf_regularization_from:
                         CONSOLE.print("Number of gaussians used for sampling in SDF regularization:", n_gaussians_in_sampling)
+                    if use_dnc_regularization and (dnc_last_loss is not None):  # [DNC]
+                        CONSOLE.print("Depth-normal consistency loss L_dnc:", dnc_last_loss.item(),
+                                      "  valid pixel ratio:", dnc_last_valid_ratio.item())
                 t0 = time.time()
                 
             # Save model
@@ -836,4 +1014,59 @@ def coarse_training_with_density_regularization(args):
                     )
 
     CONSOLE.print("Final model saved.")
+
+    # ====================[STATS] Training-cost record====================
+    # Written for EVERY run (baseline included) so that the three runs are comparable.
+    train_wallclock_s = time.time() - train_wallclock_t0
+    n_iterations_done = max(int(iteration) - int(first_iteration) + 1, 1)
+    train_stats = {
+        'run_output_dir': args.output_dir,
+        'sugar_checkpoint_path': sugar_checkpoint_path,
+        'final_model_path': model_path,
+        'scene_path': source_path,
+        'gs_checkpoint_path': gs_checkpoint_path,
+        'iteration_to_load': int(iteration_to_load),
+        'gpu_index': int(num_device),
+        'gpu_name': torch.cuda.get_device_name(num_device),
+        'seed': int(seed),
+        'dnc_factor': float(dnc_factor),
+        'dnc_start': int(dnc_start),
+        'dnc_enabled': bool(use_dnc_regularization),
+        'dnc_depth_grad_rel_thresh': float(dnc_depth_grad_rel_thresh),
+        'dnc_border': int(dnc_border),
+        'dnc_min_normal_norm': float(dnc_min_normal_norm),
+        'dnc_detach_depth': bool(dnc_detach_depth),
+        'sdf_estimation_factor': float(sdf_estimation_factor),
+        'sdf_better_normal_factor': float(sdf_better_normal_factor),
+        'num_iterations': int(num_iterations),
+        'first_iteration': int(first_iteration),
+        'last_iteration': int(iteration),
+        'n_iterations_done': n_iterations_done,
+        'train_wallclock_s': float(train_wallclock_s),
+        'train_wallclock_min': float(train_wallclock_s / 60.),
+        'total_wallclock_s': float(time.time() - func_t0),
+        'total_wallclock_min': float((time.time() - func_t0) / 60.),
+        'mean_time_per_iteration_ms': float(1000. * train_wallclock_s / n_iterations_done),
+        'max_memory_allocated_bytes': int(torch.cuda.max_memory_allocated(device)),
+        'max_memory_allocated_MiB': float(torch.cuda.max_memory_allocated(device) / 1024. ** 2),
+        'max_memory_reserved_MiB': float(torch.cuda.max_memory_reserved(device) / 1024. ** 2),
+        'n_gaussians_final': int(sugar.n_points),
+        'image_height': int(sugar.image_height),
+        'image_width': int(sugar.image_width),
+        'n_training_cameras': int(len(nerfmodel.training_cameras)),
+        'eval_split': bool(use_eval_split),
+        'final_loss': float(loss.detach().item()),
+        'last_l_dnc': float(dnc_last_loss.item()) if dnc_last_loss is not None else None,
+        'last_dnc_valid_pixel_ratio': float(dnc_last_valid_ratio.item()) if dnc_last_valid_ratio is not None else None,
+        'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+    }
+    os.makedirs(args.output_dir, exist_ok=True)
+    train_stats_path = os.path.join(args.output_dir, 'train_stats.json')
+    with open(train_stats_path, 'w') as f:
+        json.dump(train_stats, f, indent=2)
+    CONSOLE.print(f"[STATS] Training statistics saved to {train_stats_path}")
+    CONSOLE.print(f"[STATS] {n_iterations_done} iterations in {train_stats['train_wallclock_min']:.2f} min "
+                  f"({train_stats['mean_time_per_iteration_ms']:.1f} ms/iter), "
+                  f"peak CUDA memory {train_stats['max_memory_allocated_MiB']:.0f} MiB, "
+                  f"{train_stats['n_gaussians_final']} gaussians.")
     return model_path

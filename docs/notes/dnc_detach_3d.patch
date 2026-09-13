@@ -1,0 +1,57 @@
+--- a/train_coarse_density.py	2026-09-13 08:21:48.066218000 +0000
++++ b/train_coarse_density.py	2026-09-13 08:17:14.540009000 +0000
+@@ -43,6 +43,12 @@
+     parser.add_argument('--dnc_min_normal_norm', type=float, default=0.1,
+                         help='[DNC] Pixels whose alpha-composited normal has a norm below '
+                              'this value are excluded (numerical guard for low-opacity pixels).')
++    parser.add_argument('--dnc_detach_depth', type=str2bool, default=False,
++                        help='[DNC] If True, the geometric normal N_d is computed from a '
++                             'DETACHED depth map, so the DNC gradient flows only through the '
++                             'Gaussian normal map N and cannot flatten the rendered depth '
++                             '(the trivial solution of L_dnc). Default False keeps the '
++                             'behaviour of the first three reported runs unchanged.')
+     parser.add_argument('--dnc_vis_every', type=int, default=1000,
+                         help='[DNC] Save D / N / N_d / mask PNGs every N iterations (0 = off).')
+     parser.add_argument('--dnc_log_every', type=int, default=100,
+--- a/sugar_trainers/coarse_density.py	2026-09-13 08:21:48.069175000 +0000
++++ b/sugar_trainers/coarse_density.py	2026-09-13 08:17:14.543346000 +0000
+@@ -271,6 +271,10 @@
+     dnc_depth_grad_rel_thresh = float(getattr(args, 'dnc_depth_grad_rel_thresh', 0.05))
+     dnc_border = int(getattr(args, 'dnc_border', 2))
+     dnc_min_normal_norm = float(getattr(args, 'dnc_min_normal_norm', 0.1))
++    # [DNC][DETACH] If True, N_d is built from D.detach(): the DNC gradient reaches the
++    # Gaussians only through the normal map N, so "flattening the rendered depth" (the
++    # trivial minimiser of L_dnc) is no longer reachable by this term.
++    dnc_detach_depth = bool(getattr(args, 'dnc_detach_depth', False))
+     dnc_vis_every = int(getattr(args, 'dnc_vis_every', 1000))
+     dnc_log_every = int(getattr(args, 'dnc_log_every', 100))
+     # lambda == 0 -> the DNC branch is never entered, so the baseline code path is
+@@ -303,6 +307,9 @@
+     CONSOLE.print("[DNC] Depth-normal consistency factor:", dnc_factor,
+                   "(enabled)" if use_dnc_regularization else "(DISABLED - original SuGaR path)")
+     CONSOLE.print("[DNC] Depth-normal consistency start iteration:", dnc_start)
++    CONSOLE.print("[DNC] Detach depth for N_d:", dnc_detach_depth,
++                  "(gradient only through the normal map N)" if dnc_detach_depth
++                  else "(gradient through both D and N - original DNC behaviour)")
+     CONSOLE.print("[SMOKE] Total number of iterations:", num_iterations)
+     CONSOLE.print("Eval split:", use_eval_split)
+     CONSOLE.print("White background:", use_white_background)
+@@ -855,8 +862,9 @@
+                         dnc_ndc_grid = dnc_utils.make_ndc_pixel_grid(
+                             dnc_depth.shape[0], dnc_depth.shape[1], sugar.device)
+                     dnc_fx, dnc_fy, dnc_px, dnc_py = dnc_utils.get_ndc_intrinsics(dnc_fov_camera)
++                    dnc_depth_for_loss = dnc_depth.detach() if dnc_detach_depth else dnc_depth
+                     dnc_loss, dnc_aux = dnc_utils.depth_normal_consistency_loss(
+-                        dnc_depth, dnc_normal_img,
++                        dnc_depth_for_loss, dnc_normal_img,
+                         dnc_fx, dnc_fy, dnc_px, dnc_py,
+                         max_depth=dnc_max_depth,
+                         border=dnc_border,
+@@ -1027,6 +1035,7 @@
+         'dnc_depth_grad_rel_thresh': float(dnc_depth_grad_rel_thresh),
+         'dnc_border': int(dnc_border),
+         'dnc_min_normal_norm': float(dnc_min_normal_norm),
++        'dnc_detach_depth': bool(dnc_detach_depth),
+         'sdf_estimation_factor': float(sdf_estimation_factor),
+         'sdf_better_normal_factor': float(sdf_better_normal_factor),
+         'num_iterations': int(num_iterations),

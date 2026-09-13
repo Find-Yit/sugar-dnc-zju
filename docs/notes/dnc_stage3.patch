@@ -1,0 +1,741 @@
+diff --git a/sugar_trainers/coarse_density.py b/sugar_trainers/coarse_density.py
+index d24794e..b24fcc0 100644
+--- a/sugar_trainers/coarse_density.py
++++ b/sugar_trainers/coarse_density.py
+@@ -1,4 +1,6 @@
+ import os
++import json      # [STATS] training-cost record
++import random    # [REPRO] reproducibility seeding
+ import numpy as np
+ import torch
+ import open3d as o3d
+@@ -9,6 +11,7 @@ from sugar_scene.sugar_model import SuGaR
+ from sugar_scene.sugar_optimizer import OptimizationParams, SuGaROptimizer
+ from sugar_scene.sugar_densifier import SuGaRDensifier
+ from sugar_utils.loss_utils import ssim, l1_loss, l2_loss
++from sugar_utils import dnc_utils  # [DNC] depth-normal consistency helpers
+ 
+ from rich.console import Console
+ import time
+@@ -17,6 +20,20 @@ import time
+ def coarse_training_with_density_regularization(args):
+     CONSOLE = Console(width=120)
+ 
++    # ====================[REPRO] Reproducibility====================
++    # Fix every RNG at the very beginning of the trainer so that the image shuffling,
++    # the SDF point sampling and the densification are identical across runs.
++    # (The CUDA rasterizer itself is not bit-wise deterministic; this is documented
++    #  in the report.)  This block is independent from the DNC change below.
++    seed = int(getattr(args, 'seed', 0))
++    random.seed(seed)
++    np.random.seed(seed)
++    torch.manual_seed(seed)
++    torch.cuda.manual_seed_all(seed)
++    CONSOLE.print(f"[REPRO] random / numpy / torch seeded with {seed}.")
++
++    func_t0 = time.time()  # [STATS] wall clock of the whole function (setup included)
++
+     # ====================Parameters====================
+ 
+     num_device = args.gpu
+@@ -241,6 +258,24 @@ def coarse_training_with_density_regularization(args):
+     
+     sdf_estimation_factor = args.estimation_factor
+     sdf_better_normal_factor = args.normal_factor
++
++    # -----[SMOKE] Optional override of the total number of iterations-----
++    # Used only by scripts/smoke_dnc.sh; the three reported runs keep the default 15000.
++    if getattr(args, 'num_iterations', None) is not None:
++        num_iterations = int(args.num_iterations)
++        CONSOLE.print(f"[SMOKE] num_iterations overridden to {num_iterations}.")
++
++    # -----[DNC] Depth-Normal Consistency regularization parameters-----
++    dnc_factor = float(getattr(args, 'dnc_factor', 0.0))
++    dnc_start = int(getattr(args, 'dnc_start', 9000))
++    dnc_depth_grad_rel_thresh = float(getattr(args, 'dnc_depth_grad_rel_thresh', 0.05))
++    dnc_border = int(getattr(args, 'dnc_border', 2))
++    dnc_min_normal_norm = float(getattr(args, 'dnc_min_normal_norm', 0.1))
++    dnc_vis_every = int(getattr(args, 'dnc_vis_every', 1000))
++    dnc_log_every = int(getattr(args, 'dnc_log_every', 100))
++    # lambda == 0 -> the DNC branch is never entered, so the baseline code path is
++    # byte-for-byte the original SuGaR one (no extra rendering, no extra loss term).
++    use_dnc_regularization = dnc_factor > 0.
+     
+     sugar_checkpoint_path = f'sugarcoarse_3Dgs{iteration_to_load}_densityestimXX_sdfnormYY/'
+     sugar_checkpoint_path = os.path.join(args.output_dir, sugar_checkpoint_path)
+@@ -265,6 +300,10 @@ def coarse_training_with_density_regularization(args):
+     CONSOLE.print("Output directory:", args.output_dir)
+     CONSOLE.print("SDF estimation factor:", sdf_estimation_factor)
+     CONSOLE.print("SDF better normal factor:", sdf_better_normal_factor)
++    CONSOLE.print("[DNC] Depth-normal consistency factor:", dnc_factor,
++                  "(enabled)" if use_dnc_regularization else "(DISABLED - original SuGaR path)")
++    CONSOLE.print("[DNC] Depth-normal consistency start iteration:", dnc_start)
++    CONSOLE.print("[SMOKE] Total number of iterations:", num_iterations)
+     CONSOLE.print("Eval split:", use_eval_split)
+     CONSOLE.print("White background:", use_white_background)
+     CONSOLE.print("---------------------------")
+@@ -472,6 +511,28 @@ def coarse_training_with_density_regularization(args):
+     if initialize_from_trained_3dgs:
+         iteration = 7000 - 1
+     
++    # -----[DNC] Per-run state for the depth-normal consistency regularization-----
++    dnc_ndc_grid = None            # cached (x_ndc, y_ndc) pixel grid
++    dnc_last_loss = None           # last L_dnc value (detached tensor)
++    dnc_last_valid_ratio = None
++    dnc_sdf_normal_value = None    # last sdf_better_normal_loss, logged next to L_dnc (H3)
++    dnc_sdf_estim_value = None     # last sdf_estimation_loss
++    dnc_vis_dir = os.path.join(args.output_dir, 'dnc_vis')
++    dnc_log_csv = os.path.join(args.output_dir, 'dnc_log.csv')
++    if use_dnc_regularization:
++        os.makedirs(args.output_dir, exist_ok=True)
++        os.makedirs(dnc_vis_dir, exist_ok=True)
++        with open(dnc_log_csv, 'w') as _f:
++            _f.write('iteration,l_dnc,dnc_factor,valid_pixel_ratio,total_loss,'
++                     'sdf_better_normal_loss,sdf_estimation_loss,n_gaussians\n')
++        CONSOLE.print(f"[DNC] Visualizations -> {dnc_vis_dir}")
++        CONSOLE.print(f"[DNC] Per-iteration log -> {dnc_log_csv}")
++
++    # -----[STATS] Training-cost bookkeeping (recorded for every run, DNC or not)-----
++    torch.cuda.reset_peak_memory_stats(device)
++    train_wallclock_t0 = time.time()
++    first_iteration = iteration + 1
++
+     for batch in range(9_999_999):
+         if iteration >= num_iterations:
+             break
+@@ -691,6 +752,7 @@ def coarse_training_with_density_regularization(args):
+                                             loss = loss + sdf_estimation_factor * sdf_estimation_loss.mean()
+                                         else:
+                                             raise ValueError(f"Unknown sdf_estimation_mode: {sdf_estimation_mode}")
++                                        dnc_sdf_estim_value = sdf_estimation_loss.mean().detach()  # [DNC] log only
+ 
+                                     if enforce_samples_to_be_on_surface:
+                                         if squared_samples_on_surface_loss:
+@@ -728,9 +790,114 @@ def coarse_training_with_density_regularization(args):
+                                     sdf_better_normal_loss = (samples_gaussian_normals - (normal_weights[..., None] * closest_gaussian_normals).sum(dim=-2)
+                                                               ).pow(2).sum(dim=-1)  # Shape is (n_samples,)
+                                     loss = loss + sdf_better_normal_factor * sdf_better_normal_loss.mean()
++                                    dnc_sdf_normal_value = sdf_better_normal_loss.mean().detach()  # [DNC] log only
+                             else:
+                                 CONSOLE.log("WARNING: No gaussians available for sampling.")
+-                                
++
++                # ==========[DNC] Depth-Normal Consistency regularization==========
++                # Motivation: SuGaR only constrains Gaussian normals through sample-level SDF
++                # losses, so neighbouring Gaussians may still disagree, which injects noise in
++                # the normals fed to the Poisson reconstruction.  Following the depth-normal
++                # consistency loss of 2D Gaussian Splatting (Huang et al., SIGGRAPH 2024), we
++                # additionally require, at the *pixel* level, that the rendered Gaussian normal
++                # map agrees with the geometric normal of the rendered depth map.
++                # Port to SuGaR's 3D ellipsoids: the per-Gaussian normal is the smallest-scale
++                # axis (sugar.get_normals), whose sign is ambiguous, hence (i) a per-Gaussian
++                # flip towards the camera before rasterization and (ii) an absolute value in
++                # the cosine.  Conventions: see sugar_utils/dnc_utils.py.
++                if use_dnc_regularization and iteration > dnc_start:
++                    if iteration == dnc_start + 1:
++                        CONSOLE.print("\n---INFO---\nStarting depth-normal consistency (DNC) "
++                                      f"regularization, factor={dnc_factor}.")
++                    dnc_fov_camera = nerfmodel.training_cameras.p3d_cameras[camera_indices.item()]
++                    dnc_w2v = dnc_fov_camera.get_world_to_view_transform()
++
++                    # (a.1) Render the depth map D: per-Gaussian colour = view-space z,
++                    #       background filled with max_depth (same recipe as the SDF branch above).
++                    dnc_point_depth = dnc_w2v.transform_points(sugar.points)[..., 2:].expand(-1, 3)
++                    dnc_max_depth = dnc_point_depth.max().detach()
++                    dnc_depth = sugar.render_image_gaussian_rasterizer(
++                        camera_indices=camera_indices.item(),
++                        bg_color=dnc_max_depth + torch.zeros(3, dtype=torch.float, device=sugar.device),
++                        sh_deg=0,
++                        compute_color_in_rasterizer=False,
++                        compute_covariance_in_rasterizer=True,
++                        return_2d_radii=False,
++                        use_same_scale_in_all_directions=False,
++                        point_colors=dnc_point_depth,
++                    )[..., 0]
++
++                    # (a.2) Render the normal map N: per-Gaussian colour = the smallest-scale
++                    #       axis, flipped towards the camera, expressed in view space.
++                    #       (rotation is linear, so rotating per Gaussian before alpha-compositing
++                    #        is equivalent to rotating the composited map afterwards)
++                    dnc_camera_center = dnc_fov_camera.get_camera_center()
++                    dnc_world_normals = sugar.get_normals(estimate_from_points=False)
++                    dnc_world_normals = dnc_world_normals * torch.sign(
++                        (dnc_world_normals * (dnc_camera_center - sugar.points)).sum(dim=-1, keepdim=True)
++                    ).detach()
++                    dnc_view_normals = dnc_w2v.transform_normals(dnc_world_normals)
++                    dnc_normal_img = sugar.render_image_gaussian_rasterizer(
++                        camera_indices=camera_indices.item(),
++                        bg_color=torch.zeros(3, dtype=torch.float, device=sugar.device),
++                        sh_deg=0,
++                        compute_color_in_rasterizer=False,
++                        compute_covariance_in_rasterizer=True,
++                        return_2d_radii=False,
++                        use_same_scale_in_all_directions=False,
++                        point_colors=dnc_view_normals,
++                    )
++
++                    # (b, c, d) Unproject D -> view-space point map -> geometric normal N_d,
++                    #           mask out background / borders / depth discontinuities,
++                    #           L_dnc = mean_valid(1 - |cos(N, N_d)|).
++                    if (dnc_ndc_grid is None) or (dnc_ndc_grid[0].shape != dnc_depth.shape):
++                        dnc_ndc_grid = dnc_utils.make_ndc_pixel_grid(
++                            dnc_depth.shape[0], dnc_depth.shape[1], sugar.device)
++                    dnc_fx, dnc_fy, dnc_px, dnc_py = dnc_utils.get_ndc_intrinsics(dnc_fov_camera)
++                    dnc_loss, dnc_aux = dnc_utils.depth_normal_consistency_loss(
++                        dnc_depth, dnc_normal_img,
++                        dnc_fx, dnc_fy, dnc_px, dnc_py,
++                        max_depth=dnc_max_depth,
++                        border=dnc_border,
++                        depth_grad_rel_thresh=dnc_depth_grad_rel_thresh,
++                        min_normal_norm=dnc_min_normal_norm,
++                        x_ndc=dnc_ndc_grid[0], y_ndc=dnc_ndc_grid[1],
++                        return_aux=True,
++                    )
++
++                    # (e) Add the weighted term to the total loss.
++                    loss = loss + dnc_factor * dnc_loss
++                    dnc_last_loss = dnc_loss.detach()
++                    dnc_last_valid_ratio = dnc_aux['valid_ratio'].detach()
++
++                    # (f) Logging every dnc_log_every iterations, PNG dumps every dnc_vis_every.
++                    if (dnc_log_every > 0) and (iteration % dnc_log_every == 0):
++                        with torch.no_grad():
++                            _l_dnc = dnc_last_loss.item()
++                            _vr = dnc_last_valid_ratio.item()
++                            _tot = loss.detach().item()
++                            _sdfn = float(dnc_sdf_normal_value.item()) if dnc_sdf_normal_value is not None else float('nan')
++                            _sdfe = float(dnc_sdf_estim_value.item()) if dnc_sdf_estim_value is not None else float('nan')
++                        CONSOLE.print(f"[DNC] Iteration: {iteration}  L_dnc: {_l_dnc:>7f}  "
++                                      f"lambda*L_dnc: {dnc_factor * _l_dnc:>7f}  "
++                                      f"valid pixels: {_vr:.2%}  total loss: {_tot:>7f}")
++                        with open(dnc_log_csv, 'a') as _f:
++                            _f.write(f"{iteration},{_l_dnc:.8f},{dnc_factor},{_vr:.6f},"
++                                     f"{_tot:.8f},{_sdfn:.8f},{_sdfe:.8f},{sugar.n_points}\n")
++                    if (dnc_vis_every > 0) and (iteration % dnc_vis_every == 0):
++                        with torch.no_grad():
++                            dnc_utils.save_dnc_visualization(
++                                dnc_vis_dir, iteration,
++                                depth=dnc_depth,
++                                normal_pred=dnc_aux['n_pred'],
++                                normal_from_depth=dnc_aux['n_d'],
++                                mask=dnc_aux['mask'],
++                            )
++                        CONSOLE.print(f"[DNC] Saved visualizations for iteration {iteration} "
++                                      f"to {dnc_vis_dir}")
++                # ==========[DNC] end==========
++
+             else:
+                 loss = 0.
+                 
+@@ -790,6 +957,9 @@ def coarse_training_with_density_regularization(args):
+                     CONSOLE.print("Opacities:", sugar.strengths.min().item(), sugar.strengths.max().item(), sugar.strengths.mean().item(), sugar.strengths.std().item(), sep='   ')
+                     if regularize_sdf and iteration > start_sdf_regularization_from:
+                         CONSOLE.print("Number of gaussians used for sampling in SDF regularization:", n_gaussians_in_sampling)
++                    if use_dnc_regularization and (dnc_last_loss is not None):  # [DNC]
++                        CONSOLE.print("Depth-normal consistency loss L_dnc:", dnc_last_loss.item(),
++                                      "  valid pixel ratio:", dnc_last_valid_ratio.item())
+                 t0 = time.time()
+                 
+             # Save model
+@@ -836,4 +1006,58 @@ def coarse_training_with_density_regularization(args):
+                     )
+ 
+     CONSOLE.print("Final model saved.")
++
++    # ====================[STATS] Training-cost record====================
++    # Written for EVERY run (baseline included) so that the three runs are comparable.
++    train_wallclock_s = time.time() - train_wallclock_t0
++    n_iterations_done = max(int(iteration) - int(first_iteration) + 1, 1)
++    train_stats = {
++        'run_output_dir': args.output_dir,
++        'sugar_checkpoint_path': sugar_checkpoint_path,
++        'final_model_path': model_path,
++        'scene_path': source_path,
++        'gs_checkpoint_path': gs_checkpoint_path,
++        'iteration_to_load': int(iteration_to_load),
++        'gpu_index': int(num_device),
++        'gpu_name': torch.cuda.get_device_name(num_device),
++        'seed': int(seed),
++        'dnc_factor': float(dnc_factor),
++        'dnc_start': int(dnc_start),
++        'dnc_enabled': bool(use_dnc_regularization),
++        'dnc_depth_grad_rel_thresh': float(dnc_depth_grad_rel_thresh),
++        'dnc_border': int(dnc_border),
++        'dnc_min_normal_norm': float(dnc_min_normal_norm),
++        'sdf_estimation_factor': float(sdf_estimation_factor),
++        'sdf_better_normal_factor': float(sdf_better_normal_factor),
++        'num_iterations': int(num_iterations),
++        'first_iteration': int(first_iteration),
++        'last_iteration': int(iteration),
++        'n_iterations_done': n_iterations_done,
++        'train_wallclock_s': float(train_wallclock_s),
++        'train_wallclock_min': float(train_wallclock_s / 60.),
++        'total_wallclock_s': float(time.time() - func_t0),
++        'total_wallclock_min': float((time.time() - func_t0) / 60.),
++        'mean_time_per_iteration_ms': float(1000. * train_wallclock_s / n_iterations_done),
++        'max_memory_allocated_bytes': int(torch.cuda.max_memory_allocated(device)),
++        'max_memory_allocated_MiB': float(torch.cuda.max_memory_allocated(device) / 1024. ** 2),
++        'max_memory_reserved_MiB': float(torch.cuda.max_memory_reserved(device) / 1024. ** 2),
++        'n_gaussians_final': int(sugar.n_points),
++        'image_height': int(sugar.image_height),
++        'image_width': int(sugar.image_width),
++        'n_training_cameras': int(len(nerfmodel.training_cameras)),
++        'eval_split': bool(use_eval_split),
++        'final_loss': float(loss.detach().item()),
++        'last_l_dnc': float(dnc_last_loss.item()) if dnc_last_loss is not None else None,
++        'last_dnc_valid_pixel_ratio': float(dnc_last_valid_ratio.item()) if dnc_last_valid_ratio is not None else None,
++        'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
++    }
++    os.makedirs(args.output_dir, exist_ok=True)
++    train_stats_path = os.path.join(args.output_dir, 'train_stats.json')
++    with open(train_stats_path, 'w') as f:
++        json.dump(train_stats, f, indent=2)
++    CONSOLE.print(f"[STATS] Training statistics saved to {train_stats_path}")
++    CONSOLE.print(f"[STATS] {n_iterations_done} iterations in {train_stats['train_wallclock_min']:.2f} min "
++                  f"({train_stats['mean_time_per_iteration_ms']:.1f} ms/iter), "
++                  f"peak CUDA memory {train_stats['max_memory_allocated_MiB']:.0f} MiB, "
++                  f"{train_stats['n_gaussians_final']} gaussians.")
+     return model_path
+\ No newline at end of file
+diff --git a/sugar_utils/dnc_utils.py b/sugar_utils/dnc_utils.py
+new file mode 100644
+index 0000000..e865f15
+--- /dev/null
++++ b/sugar_utils/dnc_utils.py
+@@ -0,0 +1,394 @@
++"""
++dnc_utils.py -- Depth-Normal Consistency (DNC) regularization utilities for SuGaR.
++
++This module is intentionally *self-contained*: it only depends on ``torch``,
++``numpy`` and ``PIL`` so that every function can be imported and unit-tested
++without instantiating a SuGaR model, a scene or a CUDA rasterizer.
++
++--------------------------------------------------------------------------
++Coordinate / convention contract (IMPORTANT -- read before editing)
++--------------------------------------------------------------------------
++SuGaR builds its cameras with ``sugar_scene.cameras.convert_camera_from_gs_to_pytorch3d``,
++which returns a ``pytorch3d.renderer.FoVPerspectiveCameras`` whose ``K`` is produced by
++``pytorch3d.utils._get_sfm_calibration_matrix`` (column-major):
++
++        K = [[fx, 0,  px, 0],
++             [0,  fy, py, 0],
++             [0,  0,  0,  1],
++             [0,  0,  1,  0]]
++
++with ``fx = fx_pixels / s``, ``fy = fy_pixels / s``, ``s = min(W, H) / 2`` and
++``px = py = 0`` (SuGaR uses cx = W/2, cy = H/2, so the principal point offset vanishes).
++
++``FoVPerspectiveCameras.get_projection_transform`` uses this ``K`` verbatim, therefore the
++view-space -> NDC map is simply
++
++        x_ndc = fx * x_view / z_view + px
++        y_ndc = fy * y_view / z_view + py
++
++so the *unprojection* used here is the exact analytic inverse
++
++        x_view = (x_ndc - px) * z_view / fx
++        y_view = (y_ndc - py) * z_view / fy
++        z_view = z_view                                   (= the rendered depth)
++
++**View space** is the PyTorch3D camera space: **+X points left, +Y points up,
+++Z points forward, away from the camera**.  Depth is therefore *positive* in front
++of the camera, and a normal that faces the camera has ``n_z <= 0``.
++
++**Pixel -> NDC.**  The pixel grid below is the exact inverse of SuGaR's own forward
++projection ``SuGaR.get_points_depth_in_depth_map`` (sugar_scene/sugar_model.py), which does::
++
++        factor = -1 * min(H, W)
++        grid_x = factor / W * x_ndc      # grid for F.grid_sample
++        grid_y = factor / H * y_ndc
++
++and ``F.grid_sample`` maps ``grid_x = 2 (u + 0.5) / W - 1`` to column ``u``.  Inverting:
++
++        x_ndc(u) = -(2 (u + 0.5) / W - 1) * W / min(H, W)
++        y_ndc(v) = -(2 (v + 0.5) / H - 1) * H / min(H, W)
++
++(u = column index growing to the right, v = row index growing downward).  Note that the
++*shorter* image side spans [-1, 1] in NDC and the longer side spans [-a, a] with
++a = max(W, H) / min(W, H) -- the standard PyTorch3D NDC convention.  ``test_dnc_normal.py``
++verifies this round-trip numerically against ``get_points_depth_in_depth_map``'s formula and
++against ``FoVPerspectiveCameras.unproject_points``.
++
++--------------------------------------------------------------------------
++The loss
++--------------------------------------------------------------------------
++Let ``N`` be the alpha-composited per-pixel Gaussian normal (rendered in view space) and
++``N_d`` the normal obtained from the rendered depth map by central differences of the
++unprojected point map:
++
++        P(u, v)   = unproject(x_ndc(u), y_ndc(v), D(u, v))            in view space
++        dP/du     = (P(v, u+1) - P(v, u-1)) / 2
++        dP/dv     = (P(v+1, u) - P(v-1, u)) / 2
++        N_d       = normalize(dP/du  x  dP/dv)
++
++        L_dnc = mean_{valid pixels} ( 1 - |cos(N, N_d)| )
++
++The absolute value removes the sign ambiguity of the smallest-scale axis of a 3D Gaussian
++(a 3D ellipsoid has no intrinsic normal orientation, unlike a 2D Gaussian disk).
++"""
++
++import numpy as np
++import torch
++
++
++# ---------------------------------------------------------------------------
++# Camera helpers
++# ---------------------------------------------------------------------------
++def get_ndc_intrinsics(p3d_camera):
++    """Extract (fx, fy, px, py) of the PyTorch3D NDC intrinsics from a FoVPerspectiveCameras.
++
++    Args:
++        p3d_camera: a pytorch3d FoVPerspectiveCameras built by SuGaR (must carry a ``K``).
++
++    Returns:
++        Tuple of 4 zero-dim torch tensors (fx, fy, px, py) in NDC units.
++    """
++    K = p3d_camera.K
++    if K is None:
++        raise ValueError(
++            "The provided PyTorch3D camera has no K matrix; DNC needs the NDC intrinsics."
++        )
++    K = K.reshape(-1, 4, 4)[0]
++    return K[0, 0], K[1, 1], K[0, 2], K[1, 2]
++
++
++def make_ndc_pixel_grid(image_height, image_width, device, dtype=torch.float32):
++    """Pixel-center NDC coordinates matching SuGaR's PyTorch3D convention.
++
++    Returns:
++        (x_ndc, y_ndc): two tensors of shape (H, W).
++    """
++    H, W = int(image_height), int(image_width)
++    s = float(min(H, W))
++    u = torch.arange(W, device=device, dtype=dtype)
++    v = torch.arange(H, device=device, dtype=dtype)
++    x_1d = -(2.0 * (u + 0.5) / W - 1.0) * (W / s)
++    y_1d = -(2.0 * (v + 0.5) / H - 1.0) * (H / s)
++    y_grid, x_grid = torch.meshgrid(y_1d, x_1d, indexing="ij")
++    return x_grid, y_grid
++
++
++# ---------------------------------------------------------------------------
++# Depth -> 3D points -> normals  (the core, unit-tested functions)
++# ---------------------------------------------------------------------------
++def unproject_depth_ndc(depth, fx, fy, px=0.0, py=0.0, x_ndc=None, y_ndc=None):
++    """Back-project a depth map into PyTorch3D view-space points.
++
++    Args:
++        depth: (H, W) tensor, the *view-space z* of each pixel (positive in front).
++        fx, fy, px, py: NDC intrinsics (see :func:`get_ndc_intrinsics`).
++        x_ndc, y_ndc: optional precomputed (H, W) NDC pixel grids; built on the fly if None.
++
++    Returns:
++        (H, W, 3) tensor of view-space points. Differentiable w.r.t. ``depth``.
++    """
++    if depth.dim() != 2:
++        raise ValueError(f"depth must be (H, W), got {tuple(depth.shape)}")
++    H, W = depth.shape
++    if x_ndc is None or y_ndc is None:
++        x_ndc, y_ndc = make_ndc_pixel_grid(H, W, depth.device, depth.dtype)
++    x_view = (x_ndc - px) * depth / fx
++    y_view = (y_ndc - py) * depth / fy
++    return torch.stack([x_view, y_view, depth], dim=-1)
++
++
++def unproject_depth_pinhole(depth, fx_pix, fy_pix, cx_pix, cy_pix):
++    """Reference OpenCV-style pinhole unprojection (+X right, +Y down, +Z forward).
++
++    Provided for independent cross-checking of :func:`unproject_depth_ndc`; it is *not*
++    used by the training loop (SuGaR's cameras live in PyTorch3D NDC space).
++
++    Args:
++        depth: (H, W) tensor of z values.
++        fx_pix, fy_pix, cx_pix, cy_pix: intrinsics in pixel units.
++
++    Returns:
++        (H, W, 3) tensor of camera-space points.
++    """
++    H, W = depth.shape
++    u = torch.arange(W, device=depth.device, dtype=depth.dtype)
++    v = torch.arange(H, device=depth.device, dtype=depth.dtype)
++    vv, uu = torch.meshgrid(v, u, indexing="ij")
++    x = (uu + 0.5 - cx_pix) * depth / fx_pix
++    y = (vv + 0.5 - cy_pix) * depth / fy_pix
++    return torch.stack([x, y, depth], dim=-1)
++
++
++def points_to_normals(points, orient=None, eps=1e-12, return_norm=False):
++    """Normals of a structured point map via central differences + cross product.
++
++    ``n = normalize( dP/du  x  dP/dv )`` where u is the column (rightwards) and v the row
++    (downwards) index.  The 1-pixel border, where the central difference is undefined, is
++    filled with zeros.
++
++    Args:
++        points: (H, W, 3) structured point map.
++        orient: ``None`` -> no re-orientation; ``'towards_camera'`` -> force ``n_z <= 0``
++            (PyTorch3D view space, +Z away from the camera);
++            ``'away_from_camera'`` -> force ``n_z >= 0``;
++            ``'neg_z'`` / ``'pos_z'`` are aliases of the two above.
++        eps: norm clamp for the normalization.
++        return_norm: if True, also return the (H, W) raw cross-product magnitude.
++
++    Returns:
++        (H, W, 3) unit normals (border = 0), and optionally the (H, W) raw magnitude.
++    """
++    if points.dim() != 3 or points.shape[-1] != 3:
++        raise ValueError(f"points must be (H, W, 3), got {tuple(points.shape)}")
++    dpdu = 0.5 * (points[1:-1, 2:, :] - points[1:-1, :-2, :])
++    dpdv = 0.5 * (points[2:, 1:-1, :] - points[:-2, 1:-1, :])
++    n = torch.cross(dpdu, dpdv, dim=-1)
++    raw = n.norm(dim=-1, keepdim=True)
++    n = n / raw.clamp(min=eps)
++
++    if orient in ("towards_camera", "neg_z"):
++        n = n * torch.where(n[..., 2:3] > 0, -torch.ones_like(n[..., 2:3]), torch.ones_like(n[..., 2:3]))
++    elif orient in ("away_from_camera", "pos_z"):
++        n = n * torch.where(n[..., 2:3] < 0, -torch.ones_like(n[..., 2:3]), torch.ones_like(n[..., 2:3]))
++    elif orient is not None:
++        raise ValueError(f"Unknown orient={orient!r}")
++
++    out = torch.zeros_like(points)
++    out[1:-1, 1:-1, :] = n
++    if return_norm:
++        out_raw = torch.zeros(points.shape[:2], device=points.device, dtype=points.dtype)
++        out_raw[1:-1, 1:-1] = raw[..., 0]
++        return out, out_raw
++    return out
++
++
++def depth_to_view_normals(depth, fx, fy, px=0.0, py=0.0, x_ndc=None, y_ndc=None,
++                          orient="towards_camera"):
++    """Convenience composition: depth map -> view-space normals (see the two functions above)."""
++    pts = unproject_depth_ndc(depth, fx, fy, px=px, py=py, x_ndc=x_ndc, y_ndc=y_ndc)
++    return points_to_normals(pts, orient=orient)
++
++
++# ---------------------------------------------------------------------------
++# Validity mask
++# ---------------------------------------------------------------------------
++def build_dnc_mask(depth, normal_norm, max_depth, bg_depth_ratio=0.98, border=2,
++                   depth_grad_rel_thresh=0.05, min_normal_norm=0.1):
++    """Boolean (H, W) mask of pixels on which L_dnc is evaluated.
++
++    Criteria (plan section 2(c)):
++      1. ``depth < bg_depth_ratio * max_depth``  -- drops the background fill value,
++         eroded by one pixel so that the central differences never touch background;
++      2. the ``border`` outermost pixel rings are discarded;
++      3. ``max(|dD/du|, |dD/dv|) < depth_grad_rel_thresh * depth`` -- drops pixels that
++         straddle a depth discontinuity (object silhouettes), where a finite difference
++         would produce a meaningless normal;
++      4. (numerical guard, not in the plan) ``||N_raw|| > min_normal_norm`` -- the rendered
++         normal map is alpha-composited, so pixels with a low accumulated opacity carry an
++         almost-zero, direction-less vector whose normalization is unstable.
++    """
++    H, W = depth.shape
++    device = depth.device
++    mask = torch.zeros((H, W), dtype=torch.bool, device=device)
++
++    valid_depth = depth < (bg_depth_ratio * max_depth)
++    # (1) eroded foreground: the pixel and its 4 neighbours must all be foreground
++    core = (valid_depth[1:-1, 1:-1] & valid_depth[1:-1, 2:] & valid_depth[1:-1, :-2]
++            & valid_depth[2:, 1:-1] & valid_depth[:-2, 1:-1])
++
++    # (3) relative depth gradient
++    du = 0.5 * (depth[1:-1, 2:] - depth[1:-1, :-2]).abs()
++    dv = 0.5 * (depth[2:, 1:-1] - depth[:-2, 1:-1]).abs()
++    grad_ok = torch.maximum(du, dv) < (depth_grad_rel_thresh * depth[1:-1, 1:-1].abs())
++
++    mask[1:-1, 1:-1] = core & grad_ok
++
++    # (4) rendered-normal magnitude guard
++    if normal_norm is not None:
++        mask = mask & (normal_norm > min_normal_norm)
++
++    # (2) border erosion
++    b = int(border)
++    if b > 0:
++        border_mask = torch.zeros((H, W), dtype=torch.bool, device=device)
++        border_mask[b:H - b, b:W - b] = True
++        mask = mask & border_mask
++    return mask
++
++
++# ---------------------------------------------------------------------------
++# The loss itself
++# ---------------------------------------------------------------------------
++def depth_normal_consistency_loss(
++    depth,
++    normal_view,
++    fx, fy, px=0.0, py=0.0,
++    max_depth=None,
++    bg_depth_ratio=0.98,
++    border=2,
++    depth_grad_rel_thresh=0.05,
++    min_normal_norm=0.1,
++    x_ndc=None, y_ndc=None,
++    return_aux=False,
++):
++    """Depth-normal consistency loss ``mean_valid(1 - |cos(N, N_d)|)``.
++
++    Args:
++        depth: (H, W) rendered view-space depth (background filled with ``max_depth``).
++        normal_view: (H, W, 3) rendered, alpha-composited, *view-space* Gaussian normals
++            (not normalized -- its magnitude is used as the opacity guard).
++        fx, fy, px, py: NDC intrinsics of the camera the two maps were rendered with.
++        max_depth: the background fill value used for ``depth``.
++        return_aux: if True, also return a dict with ``n_d``, ``n_pred``, ``mask``,
++            ``n_valid`` and ``valid_ratio`` for logging / visualization.
++
++    Returns:
++        Zero-dim loss tensor (0.0 with no gradient when no pixel is valid), and optionally
++        the aux dict.
++    """
++    if max_depth is None:
++        max_depth = depth.max().detach()
++
++    points = unproject_depth_ndc(depth, fx, fy, px=px, py=py, x_ndc=x_ndc, y_ndc=y_ndc)
++    n_d = points_to_normals(points, orient="towards_camera")
++
++    normal_norm = normal_view.norm(dim=-1)
++    n_pred = normal_view / normal_norm.unsqueeze(-1).clamp(min=1e-8)
++
++    mask = build_dnc_mask(
++        depth, normal_norm.detach(), max_depth,
++        bg_depth_ratio=bg_depth_ratio, border=border,
++        depth_grad_rel_thresh=depth_grad_rel_thresh, min_normal_norm=min_normal_norm,
++    )
++    mask_f = mask.to(n_pred.dtype)
++    n_valid = mask_f.sum()
++
++    cos = (n_pred * n_d).sum(dim=-1)
++    per_pixel = 1.0 - cos.abs()
++    loss = (per_pixel * mask_f).sum() / n_valid.clamp(min=1.0)
++
++    if return_aux:
++        aux = {
++            "n_d": n_d,
++            "n_pred": n_pred,
++            "mask": mask,
++            "n_valid": n_valid,
++            "valid_ratio": (n_valid / float(mask.numel())),
++        }
++        return loss, aux
++    return loss
++
++
++# ---------------------------------------------------------------------------
++# Visualization (PIL only -- matplotlib is deliberately NOT a dependency)
++# ---------------------------------------------------------------------------
++def _to_uint8_gray(arr, lo=None, hi=None):
++    arr = np.asarray(arr, dtype=np.float32)
++    if lo is None:
++        lo = float(np.nanmin(arr))
++    if hi is None:
++        hi = float(np.nanmax(arr))
++    if not np.isfinite(lo) or not np.isfinite(hi) or hi - lo < 1e-12:
++        return np.zeros(arr.shape, dtype=np.uint8)
++    out = (arr - lo) / (hi - lo)
++    return (np.clip(out, 0.0, 1.0) * 255.0).astype(np.uint8)
++
++
++def _normal_to_uint8_rgb(n):
++    n = np.asarray(n, dtype=np.float32)
++    return (np.clip(n * 0.5 + 0.5, 0.0, 1.0) * 255.0).astype(np.uint8)
++
++
++def save_dnc_visualization(out_dir, iteration, depth, normal_pred, normal_from_depth, mask,
++                           max_depth=None, save_grid=True):
++    """Dump D / N / N_d / mask as PNGs into ``out_dir`` (created if needed).
++
++    Returns the list of written file paths.
++    """
++    import os
++    from PIL import Image
++
++    os.makedirs(out_dir, exist_ok=True)
++
++    def _np(x):
++        return x.detach().float().cpu().numpy()
++
++    d = _np(depth)
++    m = _np(mask).astype(bool) if mask is not None else None
++    npred = _np(normal_pred)
++    nd = _np(normal_from_depth)
++
++    # Depth is normalized on the valid (foreground) pixels only, using 1%/99% percentiles
++    # so that a few outliers do not flatten the whole visualization.
++    if m is not None and m.sum() > 0:
++        lo, hi = np.percentile(d[m], [1.0, 99.0])
++    else:
++        lo, hi = float(d.min()), float(d.max())
++    d_img = _to_uint8_gray(d, lo=float(lo), hi=float(hi))
++
++    paths = []
++    tag = f"iter{int(iteration):06d}"
++    items = [
++        (f"{tag}_depth.png", Image.fromarray(d_img, mode="L")),
++        (f"{tag}_normal_rendered.png", Image.fromarray(_normal_to_uint8_rgb(npred), mode="RGB")),
++        (f"{tag}_normal_from_depth.png", Image.fromarray(_normal_to_uint8_rgb(nd), mode="RGB")),
++    ]
++    if m is not None:
++        items.append((f"{tag}_mask.png", Image.fromarray((m * 255).astype(np.uint8), mode="L")))
++    for name, img in items:
++        p = os.path.join(out_dir, name)
++        img.save(p)
++        paths.append(p)
++
++    if save_grid:
++        H, W = d.shape
++        grid = np.zeros((2 * H, 2 * W, 3), dtype=np.uint8)
++        grid[:H, :W] = np.stack([d_img] * 3, axis=-1)
++        grid[:H, W:] = _normal_to_uint8_rgb(npred)
++        grid[H:, :W] = _normal_to_uint8_rgb(nd)
++        if m is not None:
++            grid[H:, W:] = np.stack([(m * 255).astype(np.uint8)] * 3, axis=-1)
++        p = os.path.join(out_dir, f"{tag}_grid.png")
++        Image.fromarray(grid, mode="RGB").save(p)
++        paths.append(p)
++    return paths
+diff --git a/train_coarse_density.py b/train_coarse_density.py
+index 51e16be..c018fc3 100644
+--- a/train_coarse_density.py
++++ b/train_coarse_density.py
+@@ -27,6 +27,37 @@ if __name__ == "__main__":
+     
+     parser.add_argument('--gpu', type=int, default=0, help='Index of GPU device to use.')
+ 
++    # -----[DNC] Depth-Normal Consistency regularization (new) -----
++    parser.add_argument('--dnc_factor', type=float, default=0.0,
++                        help='[DNC] Weight lambda of the depth-normal consistency loss. '
++                             '0.0 (default) completely disables the DNC code path, so the '
++                             'baseline behaves exactly like the original SuGaR.')
++    parser.add_argument('--dnc_start', type=int, default=9000,
++                        help='[DNC] Iteration after which the depth-normal consistency loss '
++                             'is applied (same schedule as the SDF regularization by default).')
++    parser.add_argument('--dnc_depth_grad_rel_thresh', type=float, default=0.05,
++                        help='[DNC] Pixels whose relative depth gradient exceeds this value '
++                             '(object silhouettes) are excluded from the loss.')
++    parser.add_argument('--dnc_border', type=int, default=2,
++                        help='[DNC] Number of image border pixels excluded from the loss.')
++    parser.add_argument('--dnc_min_normal_norm', type=float, default=0.1,
++                        help='[DNC] Pixels whose alpha-composited normal has a norm below '
++                             'this value are excluded (numerical guard for low-opacity pixels).')
++    parser.add_argument('--dnc_vis_every', type=int, default=1000,
++                        help='[DNC] Save D / N / N_d / mask PNGs every N iterations (0 = off).')
++    parser.add_argument('--dnc_log_every', type=int, default=100,
++                        help='[DNC] Print and log L_dnc every N iterations.')
++
++    # -----[SMOKE] Total number of iterations override (for the smoke test only) -----
++    parser.add_argument('--num_iterations', type=int, default=None,
++                        help='[SMOKE] Override the total number of training iterations '
++                             '(default None = keep the original 15000). Only meant for '
++                             'smoke tests; the three reported runs all use the default.')
++
++    # -----[REPRO] Random seed -----
++    parser.add_argument('--seed', type=int, default=0,
++                        help='[REPRO] Seed for random / numpy / torch.')
++
+     args = parser.parse_args()
+     
+     # Call function

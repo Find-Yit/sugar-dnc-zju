@@ -1,4 +1,6 @@
 import os
+import json  # [ADDED] for extract_stats.json
+import time  # [ADDED] for extract_stats.json
 import numpy as np
 import open3d as o3d
 import torch
@@ -10,6 +12,92 @@ from sugar_utils.general_utils import str2bool
 from sugar_utils.spherical_harmonics import SH2RGB
 
 from rich.console import Console
+
+# ---------------------------------------------------------------------------
+# [ADDED - ported from Gaussian Frosting]
+# Automatic selection of the Poisson octree depth.
+#
+# Source (body copied verbatim):
+#   Anttwo/Frosting -> frosting_extractors/coarse_shell.py, lines 17-49
+#   https://github.com/Anttwo/Frosting/blob/main/frosting_extractors/coarse_shell.py
+#   raw: https://raw.githubusercontent.com/Anttwo/Frosting/main/frosting_extractors/coarse_shell.py
+#   Paper: Guedon & Lepetit, "Gaussian Frosting: Editable Complex Radiance Fields
+#          with Real-Time Rendering", ECCV 2024 (Oral) -- same authors as SuGaR.
+#          Supplementary material, section 7 "Improving surface reconstruction":
+#          SuGaR hard-codes a large depth D=10 for every scene; when the octree
+#          resolution is too high w.r.t. the scene's level of detail, the ellipsoidal
+#          shape of the Gaussians shows up as bumps on the surface and holes appear.
+#
+# Idea: take the 10% quantile of the nearest-neighbour distance of the foreground,
+#       opaque Gaussians (normalised by the bounding-box size), ask the Poisson cell
+#       size to be about 1/100 of it, and solve for
+#           D = min(floor(-log2(100 * d_10%)), 10).
+#       Denser Gaussians -> larger D; sparser Gaussians -> automatically smaller D.
+#
+# NOTE: pytorch3d's knn_points(...).dists returns *SQUARED* distances. Frosting uses
+#       them as-is and the constant cell_size_nn_distance_ratio=100 was tuned with that
+#       convention, so the body below is copied verbatim and is deliberately NOT
+#       "fixed" by taking a square root.
+#
+# The ONLY modification w.r.t. the original is the optional `return_details` keyword
+# (default False -> identical signature/behaviour), which additionally returns the
+# intermediate quantities so that they can be logged to extract_stats.json.
+# ---------------------------------------------------------------------------
+def compute_optimal_poisson_depth(
+    sugar:SuGaR,
+    cell_size_nn_distance_ratio:float=100,
+    max_poisson_depth:int=10,
+    fg_bbox_factor=1.,
+    opacity_threshold=0.5,
+    quantile_to_use=0.1,
+    return_details:bool=False,
+    ):
+
+    # Compute foreground bbox
+    _cameras_spatial_extent, _camera_average_xyz = sugar.get_cameras_spatial_extent(return_average_xyz=True)
+    fg_bbox_min_tensor = _camera_average_xyz - fg_bbox_factor * _cameras_spatial_extent * torch.ones(1, 3, device=sugar.device)
+    fg_bbox_max_tensor = _camera_average_xyz + fg_bbox_factor * _cameras_spatial_extent * torch.ones(1, 3, device=sugar.device)
+    fg_mask = (sugar.points > fg_bbox_min_tensor).all(dim=-1) * (sugar.points < fg_bbox_max_tensor).all(dim=-1)
+
+    # Remove transparent gaussians
+    opacity_mask = sugar.strengths[..., 0] > opacity_threshold
+    mask = opacity_mask * fg_mask
+
+    # Compute poisson bbox
+    bbox_size = 1.1 * (sugar.points[mask].max(dim=0)[0] - sugar.points[mask].min(dim=0)[0]).max().item()
+
+    # Compute nearest neighbor distances and normalize by bbox size
+    nn_dists = knn_points(sugar.points[mask][None], sugar.points[mask][None], K=2).dists[0, ..., 1]
+    norm_nn_dists = nn_dists / bbox_size
+    quantile_dist = norm_nn_dists.quantile(quantile_to_use).item()
+
+    # Compute optimal poisson depth
+    poisson_depth = -np.log2(cell_size_nn_distance_ratio * quantile_dist)
+    poisson_depth = np.floor(poisson_depth).astype(int)
+    poisson_depth = min(poisson_depth, max_poisson_depth)
+
+    if return_details:
+        details = {
+            'cell_size_nn_distance_ratio': float(cell_size_nn_distance_ratio),
+            'max_poisson_depth': int(max_poisson_depth),
+            'fg_bbox_factor': float(fg_bbox_factor),
+            'opacity_threshold': float(opacity_threshold),
+            'quantile_to_use': float(quantile_to_use),
+            'cameras_spatial_extent': float(_cameras_spatial_extent),
+            'camera_average_xyz': [float(v) for v in _camera_average_xyz.flatten().tolist()],
+            'n_gaussians_total': int(sugar.points.shape[0]),
+            'n_gaussians_fg': int(fg_mask.sum().item()),
+            'n_gaussians_opaque': int(opacity_mask.sum().item()),
+            'n_gaussians_used': int(mask.sum().item()),
+            'bbox_size': float(bbox_size),
+            'quantile_dist_normalized_SQUARED': float(quantile_dist),
+            'nn_dist_note': 'knn_points returns SQUARED distances (pytorch3d); copied verbatim from Frosting, not square-rooted',
+            'raw_depth_before_floor': float(-np.log2(cell_size_nn_distance_ratio * quantile_dist)),
+            'poisson_depth': int(poisson_depth),
+        }
+        return int(poisson_depth), details
+    return poisson_depth
+
 
 def extract_mesh_from_coarse_sugar(args):
     CONSOLE = Console(width=120)
@@ -40,11 +128,41 @@ def extract_mesh_from_coarse_sugar(args):
     # Mesh computation parameters
     fg_bbox_factor = 1.  # 1.
     bg_bbox_factor = 4.  # 4.
+    # [MODIFIED] These two used to be hard-coded here; they are now overridable from the
+    # command line (extract_mesh.py --poisson_depth / --vertices_density_quantile).
+    # The values below are the original SuGaR defaults and are kept as fallbacks, so
+    # running extract_mesh.py without the new flags reproduces the original behaviour exactly.
     poisson_depth = 10  # 10 for most real scenes. 6 or 7 work well for most synthetic scenes
     vertices_density_quantile = 0.1  # 0.1 for most real scenes. 0. works well for most synthetic scenes
     decimate_mesh = True
     clean_mesh = True
     project_mesh_on_surface_points = args.project_mesh_on_surface_points
+
+    # [ADDED] Poisson depth / cleaning quantile now come from the command line.
+    # --poisson_depth is a *string* so that it accepts either an integer ("10") or "auto"
+    # ("-1" is also accepted, that is the spelling Frosting uses for "auto").
+    poisson_depth_arg = str(getattr(args, 'poisson_depth', '10')).strip()
+    use_auto_poisson_depth = poisson_depth_arg.lower() in ('auto', '-1')
+    if not use_auto_poisson_depth:
+        poisson_depth = int(poisson_depth_arg)
+    poisson_depth_str = 'auto' if use_auto_poisson_depth else str(poisson_depth)
+    vertices_density_quantile = float(getattr(args, 'vertices_density_quantile', 0.1))
+    cell_size_nn_distance_ratio = float(getattr(args, 'cell_size_nn_distance_ratio', 100.))
+    only_report_depth = bool(getattr(args, 'only_report_depth', False))
+    extract_stats = {
+        'poisson_depth_arg': poisson_depth_arg,
+        'poisson_depth_is_auto': bool(use_auto_poisson_depth),
+        'vertices_density_quantile': vertices_density_quantile,
+        'cell_size_nn_distance_ratio': cell_size_nn_distance_ratio,
+        'only_report_depth': only_report_depth,
+        'coarse_model_path': args.coarse_model_path,
+        'scene_path': args.scene_path,
+        'gs_checkpoint_path': args.checkpoint_path,
+        'surface_level_arg': args.surface_level,
+        'decimation_target_arg': args.decimation_target,
+        'eval_split': bool(args.eval),
+    }
+    _extract_t0 = time.time()
     
     # Vanilla 3DGS data
     source_path = args.scene_path
@@ -120,6 +238,10 @@ def extract_mesh_from_coarse_sugar(args):
     CONSOLE.print("Use centers to extract mesh:", use_centers_to_extract_mesh)
     CONSOLE.print("Use marching cubes:", use_marching_cubes)
     CONSOLE.print("Use vanilla 3DGS:", use_vanilla_3dgs)
+    CONSOLE.print("Poisson depth:", poisson_depth_str)  # [ADDED]
+    CONSOLE.print("Vertices density quantile (cleaning quantile):", vertices_density_quantile)  # [ADDED]
+    CONSOLE.print("Cell size / NN distance ratio (auto depth only):", cell_size_nn_distance_ratio)  # [ADDED]
+    CONSOLE.print("Only report depth (no extraction):", only_report_depth)  # [ADDED]
     CONSOLE.print("--------------------")
     
     # Set the GPU
@@ -187,7 +309,32 @@ def extract_mesh_from_coarse_sugar(args):
     CONSOLE.print("Coarse model parameters:")
     for name, param in sugar.named_parameters():
         CONSOLE.print(name, param.shape, param.requires_grad)
-    
+
+    # [ADDED] Frosting-style automatic Poisson depth. Computed here, i.e. BEFORE the
+    # low-opacity pruning below, exactly like Frosting (coarse_shell.py:234-240) -- the
+    # function applies its own opacity_threshold=0.5 mask internally.
+    if use_auto_poisson_depth or only_report_depth:
+        CONSOLE.print("Computing optimal poisson depth...")
+        _auto_depth, _auto_details = compute_optimal_poisson_depth(
+            sugar,
+            cell_size_nn_distance_ratio=cell_size_nn_distance_ratio,
+            return_details=True,
+            )
+        CONSOLE.print("Optimal poisson depth:", _auto_depth)
+        CONSOLE.print("  -> details:", _auto_details)
+        extract_stats['auto_poisson_depth'] = int(_auto_depth)
+        extract_stats['auto_depth_details'] = _auto_details
+        if use_auto_poisson_depth:
+            poisson_depth = int(_auto_depth)
+    extract_stats['poisson_depth_used'] = int(poisson_depth)
+    _stats_path = os.path.join(mesh_output_dir, 'extract_stats.json')
+    with open(_stats_path, 'w') as _f:
+        json.dump(extract_stats, _f, indent=2)
+    CONSOLE.print("Extraction stats written to", _stats_path)
+    if only_report_depth:
+        CONSOLE.print("[only_report_depth=True] Skipping the actual mesh extraction.")
+        return []
+
     # Pruning low opacity gaussians
     with torch.no_grad():
         CONSOLE.print("Number of gaussians:", sugar.n_points)
@@ -788,5 +935,11 @@ def extract_mesh_from_coarse_sugar(args):
         o3d.io.write_triangle_mesh(sugar_mesh_path, decimated_o3d_mesh, write_triangle_uvs=True, write_vertex_colors=True, write_vertex_normals=True)
         CONSOLE.print("Mesh saved at", sugar_mesh_path)
         all_sugar_mesh_paths.append(sugar_mesh_path)
-        
+
+    # [ADDED] final extraction stats (mesh paths + wall clock)
+    extract_stats['mesh_paths'] = list(all_sugar_mesh_paths)
+    extract_stats['extraction_wall_clock_s'] = float(time.time() - _extract_t0)
+    with open(os.path.join(mesh_output_dir, 'extract_stats.json'), 'w') as _f:
+        json.dump(extract_stats, _f, indent=2)
+
     return all_sugar_mesh_paths

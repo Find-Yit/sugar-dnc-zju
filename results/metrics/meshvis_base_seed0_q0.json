@@ -1,0 +1,57 @@
+{
+  "run_name": "base_seed0_q0",
+  "view_indices": [
+    0,
+    8,
+    16,
+    24
+  ],
+  "image_names": {
+    "0": "000001",
+    "8": "000065",
+    "16": "000129",
+    "24": "000193"
+  },
+  "depth_ranges": {
+    "0": [
+      2.024261794090271,
+      23.401269664764392
+    ],
+    "8": [
+      1.6669009661674499,
+      25.941947326660156
+    ],
+    "16": [
+      1.083734827041626,
+      24.093999290466307
+    ],
+    "24": [
+      1.1676681017875672,
+      21.152302513122567
+    ]
+  },
+  "mesh_pixel_coverage": {
+    "0": 0.9997118985883031,
+    "8": 0.9999644550206348,
+    "16": 0.9998877526967415,
+    "24": 1.0
+  },
+  "config": {
+    "mesh_path": "/scratch/e1351071/zju_test/outputs/runs/mesh_base_seed0_q0/sugarmesh_3Dgs7000_densityestim02_sdfnorm02_level03_decim200000.ply",
+    "scene_path": "/scratch/e1351071/zju_test/data/tandt/truck",
+    "gs_checkpoint": "/scratch/e1351071/zju_test/outputs/baseline/gs_truck",
+    "image_height": 546,
+    "image_width": 979,
+    "n_vertices": 169359,
+    "n_faces": 332214,
+    "normal_encoding": "world-space face normal, flipped toward camera, rgb=(n*0.5+0.5)*255, background=white",
+    "depth_source": "pytorch3d fragments.zbuf (camera-space z, scene units), background=white",
+    "depth_colormap": "matplotlib turbo (256-entry LUT)",
+    "depth_range_rule": "per-view [p1, p99] of hit pixels",
+    "faces_per_pixel": 1,
+    "blur_radius": 0.0,
+    "eval_split_interval": 8,
+    "gpu": 0
+  },
+  "wall_clock_sec": 14.21
+}

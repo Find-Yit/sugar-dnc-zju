@@ -150,4 +150,57 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
-learnableearthparser/fast_sampler/_sampler.c
+learnableearthparser/fast_sampler/_sampler.c# ---------------------------------------------------------------- 大文件：一律不进仓库
+# SuGaR / 3DGS 的默认输出目录
+output/
+outputs/
+outputs/runs/
+runs/
+
+# 模型权重与点云 / 网格（单个动辄几百 MB）
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.ply
+*.splat
+*.npz
+
+# 数据集与缓存
+data/
+ckpts/
+wheels/
+*.zip
+*.tar
+*.tar.gz
+
+# ---------------------------------------------------------------- 例外：小体积结果要进仓库
+# 指标表、逐视角 CSV、图表（KB~MB 级），用于让别人不跑实验也能核对结论
+!results/
+!results/**
+!figures/
+!figures/**
+!report.pdf
+
+# ---------------------------------------------------------------- Python / 编辑器 / 系统
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# ---------------------------------------------------------------- 日志
+logs/
+*.log
+nohup.out

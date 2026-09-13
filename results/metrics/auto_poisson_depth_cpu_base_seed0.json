@@ -1,0 +1,19 @@
+{
+  "n_total": 429423,
+  "n_fg": 112393,
+  "n_opaque": 282930,
+  "n_used": 77679,
+  "cameras_spatial_extent": 5.892506103467553,
+  "camera_average_xyz": [
+    0.05621462147607421,
+    -0.013698028412975691,
+    0.1842581174338237
+  ],
+  "bbox_size": 12.955994987487793,
+  "quantile_dist_normalized_SQUARED": 5.2947974296484575e-06,
+  "raw_depth_before_floor": 10.883136889445527,
+  "poisson_depth": 10,
+  "ratio": 100.0,
+  "quantile": 0.1,
+  "n_train_cameras": 219
+}

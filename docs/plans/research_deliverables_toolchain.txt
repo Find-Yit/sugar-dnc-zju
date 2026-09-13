@@ -1,0 +1,167 @@
+TL;DR
+建立一套与项目复现环境完全隔离、全部落在本项目目录中的科研交付工具链：
+1. 仓库级安装 OpenAI 官方 pdf skill；
+2. 单独创建 tools/doc_env Python venv，生成 PPTX、DOCX、PDF 和科研图表；
+3. 安装可自由分发的中英文字体；
+4. 视 smoke test 结果安装项目内便携版 LibreOffice，用于 PPTX/DOCX 转 PDF 和视觉验收；
+5. 生成全中文 smoke-test 文档并逐页渲染检查。
+
+所有正式报告、演示文稿和图片均面向浙江大学汇报，必须以中文为主语言；图内文字同样执行中文要求。
+
+本计划不修改 /scratch/e1351071/virtualenvs/zju_test，不安装/升级 torch，也不删除或覆盖现有文件。
+
+一、现状（2026-09-13 实测）
+
+- 项目目前只有 CLAUDE.md，本项目文档工具链尚未建立。
+- 当前 ML venv 仅有 pip 22.0.2 与 setuptools 59.6.0，必须保持干净。
+- OpenAI curated skills 中只有 pdf 与交付任务直接相关；没有官方 slides/docs skill。
+- imagegen 是 Codex 内置 system skill，已可用，无需重复安装。
+- Python 包 python-pptx、python-docx、reportlab、PyMuPDF、pypdf、pdfplumber、Pillow、matplotlib、seaborn、pandas、numpy 等均缺失。
+- 系统没有 LibreOffice、Pandoc、Typst、TeX、Poppler、Ghostscript、Chromium。
+- fontconfig 命令存在，但 fc-list 没列出可用字体；必须准备字体，否则中文会变方框。
+- /scratch 可用空间约 3.2 PB；/tmp 可用约 263 GB，空间不是风险。
+
+二、目录与隔离策略
+
+计划新增：
+
+  .agents/skills/pdf/                 OpenAI 官方 PDF skill（仓库级）
+  .agents/skills/scientific-deliverables/  项目专用科研交付 skill
+  tools/doc_env/                      独立 Python venv
+  tools/libreoffice/                  可选的便携版 LibreOffice
+  assets/fonts/                       项目内字体
+  assets/templates/                   PPT/Word/PDF 科研模板与主题
+  scripts/deliverables/               可复用生成、渲染、验收脚本
+  outputs/presentations/              最终 PPTX
+  outputs/reports/                    最终 DOCX/PDF
+  outputs/previews/                   逐页 PNG/JPG 预览
+  notes/doc_toolchain/                 版本锁、安装与验收记录
+
+所有 pip 命令明确使用 tools/doc_env/bin/python -m pip，禁止误装到 ML venv。
+
+三、技能方案
+
+阶段 S1：安装官方 pdf skill
+
+- 来源：openai/skills 的 skills/.curated/pdf。
+- 目标：项目内 .agents/skills，而不是写入 home，符合项目归档要求。
+- 作用：强制 PDF 生成后逐页渲染、检查裁切/重叠/乱码，并做文本抽取校验。
+- 安装后若当前会话未自动发现，则下一轮或重启 Codex 后生效。
+
+阶段 S2：创建项目专用 scientific-deliverables skill
+
+- 使用 Codex 内置 skill-creator 创建，不从不明第三方仓库安装 slides/docs skill。
+- 覆盖 PPTX、DOCX、PDF、科研图表四类产物的统一流程。
+- 明确科研风格规则：16:9；克制配色；高信息密度但保留留白；图表统一字体/字号/线宽；结论优先；实验设置、指标、基线与消融可追溯；引用可读；不伪造实验数据。
+- 明确中文规则：标题、正文、摘要、目录、页眉页脚、表头、图例、坐标轴、数据标注、流程图节点、图注、脚注、结论和图片内嵌文字全部使用中文。
+- 仅公式变量、国际通用缩写、软件/模型官方名称、URL/DOI 和参考文献原始题名可保留必要英文；缩写及专有名词首次出现时给出中文解释，不允许出现无说明的整页英文内容。
+- 明确验收：源文件可打开、页数正确、中文/公式/图表可见、无溢出、PDF 逐页预览通过、文本可抽取。
+- 产物路径服从本项目 CLAUDE.md，统一写 outputs/，不采用官方 pdf skill 的默认 output/pdf 路径。
+
+四、Python 文档环境
+
+阶段 P1：创建隔离 venv
+
+  python3 -m venv tools/doc_env
+  tools/doc_env/bin/python -m pip install --upgrade pip setuptools wheel
+
+阶段 P2：安装最小可靠依赖
+
+Office 原生文件：
+- python-pptx：生成可编辑 PPTX。
+- python-docx：生成可编辑 DOCX。
+
+PDF 与验收：
+- reportlab：直接生成 PDF。
+- pymupdf：无 Poppler 时负责 PDF 渲染与检查。
+- pypdf、pdfplumber：页数、元数据和文本抽取检查。
+
+科研图表与图像：
+- numpy、pandas、scipy：数据处理与统计。
+- matplotlib、seaborn、scienceplots：科研图表和统一样式（禁用依赖 LaTeX 的样式选项）。
+- Pillow：位图处理、缩略图、拼图和分辨率检查。
+- cairosvg：SVG 转 PNG/PDF；若本机 cairo 运行库不足则标为可选，不阻塞主流程。
+
+模板与 XML：
+- Jinja2：模板化内容。
+- lxml：OOXML/结构检查（通常也是 Office 包依赖）。
+
+安装时使用官方 PyPI：--retries 10 --timeout 60。解析完成后输出 exact freeze 到 notes/doc_toolchain/requirements.lock.txt。
+
+暂不安装：
+- plotly/kaleido：基础科研图表不需要，且依赖更重；具体任务需要交互或特殊图形时再加。
+- weasyprint：依赖系统图形库，直接用 ReportLab 更稳。
+- Pandoc/TeX/Typst：当前不是硬需求，且会扩大安装与字体风险；公式先用 Matplotlib MathText 或嵌入矢量图。
+- 全局 npm 包：首选单一 Python 工具链，避免维护第二套依赖。
+
+五、字体
+
+- 将开源 Noto Sans CJK SC 与 Noto Serif CJK SC（或等价 Source Han 字体）下载到 assets/fonts/。
+- 所有 PDF/预览显式注册项目内字体，避免依赖节点系统字体。
+- PPTX/DOCX 使用可移植的字体回退策略，并在交付说明中列出字体；如 Office 字体嵌入不可行，至少附带字体文件和 PDF 定稿版。
+- 验收字符至少覆盖：中文标题、英文、数字、希腊字母、上下标、常用公式符号。
+
+六、Office 渲染方案
+
+当前没有 LibreOffice，因此不能可靠地把 PPTX/DOCX 渲染为 PDF 做视觉回归。
+
+推荐在 Python 工具链 smoke test 通过后，安装官方 Linux x86_64 便携/可解压版 LibreOffice 到 tools/libreoffice/：
+
+- 不使用 sudo，不写 /usr，不修改系统包。
+- 使用 headless 模式转换 PPTX/DOCX 到 PDF。
+- 设 15 分钟熔断；若官方包或动态库不兼容，立即停手，保留 Python 生成与 OOXML 结构检查能力，并提示用户在有 Office/LibreOffice 的机器上完成最终视觉验收。
+
+七、端到端 Smoke Test 与验收标准
+
+生成一套非正式的 smoke-test 产物（不冒充真实实验结果）：
+
+1. PPTX：16:9，至少 4 页，含中文标题、中文流程图、中文对比表、带中文坐标轴和图例的科研曲线/柱状图及公式。
+2. DOCX：含中文标题层级、中文摘要、表格、图片、图注、公式图片、参考文献示例、页眉页脚与页码。
+3. PDF：含中文封面、目录/摘要、图表、表格、参考文献和页码。
+4. 对 PDF 逐页渲染 PNG；若 LibreOffice 可用，也对 PPTX/DOCX 转出的 PDF 逐页渲染。
+5. 用 PyMuPDF/pypdf/pdfplumber 检查页数、可打开性与文本抽取。
+6. 用 python-pptx/python-docx 重新打开源文件，确认 OOXML 没损坏。
+7. 人工视觉检查预览图：零裁切、零重叠、零黑块、零中文方框、图表标签可读；扫描可见文本，确认除允许例外外均为中文。
+8. 记录工具版本、文件大小、页数、检查结果到 notes/doc_toolchain/SELF_CHECK.md。
+9. 复验 ML venv 的 pip list 与准备前一致，证明未污染复现环境。
+
+八、时间预算与回退
+
+- 官方 pdf skill：2-5 分钟。
+- 项目专用 skill 与模板骨架：15-25 分钟。
+- Python venv + 依赖：10-20 分钟。
+- 字体：5-10 分钟。
+- LibreOffice：10-20 分钟，超过 15 分钟无可用迹象即熔断。
+- Smoke test + 逐页验收：15-25 分钟。
+- 总预算：约 45-75 分钟；LibreOffice 失败时约 35-55 分钟。
+
+回退顺序：
+
+1. Poppler 缺失 -> 使用 PyMuPDF 渲染 PDF。
+2. CairoSVG 失败 -> Matplotlib/Pillow 输出 PNG，主流程继续。
+3. LibreOffice 失败 -> 保留原生 PPTX/DOCX + 直接生成 PDF + OOXML 检查，最终 Office 视觉检查转移到用户本地。
+4. 字体注册失败 -> 将关键中文文字栅格化到图中，但 Word/PPT 正文仍需附字体并本地复验。
+
+九、执行边界
+
+- 必须先得到用户对本计划的批准，再进行安装和创建技能。
+- 不安装或升级 torch/torchvision/torchaudio，不读取或修改未知项目依赖。
+- 不删除、不覆盖现有文件；若目标目录意外已存在，先报告再处理。
+- 任何下载均用官方源或项目官方发布源，并记录来源与版本。
+- 安装后输出阶段 checklist：已完成、未完成、风险/偏差。
+
+十、执行结果（2026-09-13）
+
+- [x] 仓库级安装官方 PDF 技能。
+- [x] 创建并校验项目专用全中文科研交付技能。
+- [x] 创建独立 `tools/doc_env`，安装并锁定 PPTX、DOCX、PDF、图表和验收依赖。
+- [x] 安装项目内中文字体，并验证常用中文、英文、数字、希腊字母与公式符号覆盖。
+- [x] 安装项目内 LibreOffice 及所需本地动态库，无系统级改动。
+- [x] 生成全中文 PPTX、DOCX、两类 PDF 和三组科研图表测试样例。
+- [x] 对三个 PDF 逐页渲染，完成结构、文本、分页、空白页、越界对象与人工视觉检查。
+- [x] 复验原机器学习虚拟环境，仍只有准备前的 `pip==22.0.2` 与 `setuptools==59.6.0`。
+- [x] 完整保留历次修订版本，没有删除或覆盖旧产物。
+
+最终自动检查全部通过；详细结果见 `notes/doc_toolchain/FINAL_SELF_CHECK_v3.md`，安装与复现说明见 `notes/doc_toolchain/INSTALLATION_SUMMARY.md`。
+
+已知非阻断提示：项目内 LibreOffice 启动时输出两行 Python 前缀探测提示，但版本查询、PPTX/DOCX 转 PDF、文本抽取与逐页渲染均成功。未触发回退方案。

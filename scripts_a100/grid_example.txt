@@ -1,0 +1,3 @@
+# TAG|GPU|COARSE_PT(留空=默认 coarse_base_seed0)|EXTRA
+pdauto_s0|0||--poisson_depth_bg auto --extract_seed 0
+q0_s0|1||--vertices_density_quantile 0 --extract_seed 0

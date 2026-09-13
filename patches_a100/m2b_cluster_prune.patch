@@ -1,0 +1,583 @@
+diff --git a/sugar_utils/cluster_prune.py b/sugar_utils/cluster_prune.py
+new file mode 100644
+index 0000000..4d38680
+--- /dev/null
++++ b/sugar_utils/cluster_prune.py
+@@ -0,0 +1,236 @@
++"""
++[ADDED - M2-B] DBSCAN cluster pruning of Gaussian centers, as a *stand-alone*
++pre-processing step applied to a trained coarse SuGaR model.
++
++Origin of the idea (see notes/SURVEY2_sugar_direct_followups.md, section 2.3):
++    prajwalcr/2d-sugar -> gaussian_splatting_2d/scene/gaussian_model.py:429
++        def cluster_gaussians(self, save_path, opt_args):
++            def estimate_eps(points, min_samples=6, percentile=90):
++                nbrs = NearestNeighbors(n_neighbors=min_samples).fit(points)
++                distances, _ = nbrs.kneighbors(points)
++                k_distances = distances[:, -1]   # distance to the k-th neighbour
++                eps = np.percentile(k_distances, percentile)
++                return eps
++            points = self._xyz.detach().cpu().numpy()
++            eps = estimate_eps(points, min_samples=..., percentile=...)
++            cluster_ids = DBSCAN(eps=eps, min_samples=...).fit_predict(points)
++    prajwalcr/2d-sugar -> gaussian_splatting_2d/train.py:140-151
++            retained_cluster_id = max(cluster_sizes.items(), key=lambda it: it[1])[0]
++            gaussians.prune_points(cluster_ids != retained_cluster_id)
++
++Our modifications (M2 + M2+b):
++  * rule='keep_large' (default): keep EVERY cluster whose size is >= a fraction of
++    the total number of points, instead of only the single largest one.  Only small
++    clusters and DBSCAN noise (label -1) are pruned.  The original "only the largest
++    cluster survives" behaviour is still available as rule='largest', and is kept
++    around as the failure-case control (it deletes the whole background of scenes
++    such as Truck, where the background is its own connected component).
++  * separate_fg_bg (default True): the foreground (inside the camera bbox, the same
++    fg_bbox_factor=1 convention as sugar_extractors/coarse_mesh.py) is much denser
++    than the background, so a single global eps estimated on all points is dominated
++    by the foreground and is far too small for the background -> the background gets
++    labelled as noise and wiped out.  We therefore estimate eps and run DBSCAN
++    independently inside and outside the foreground bbox.
++
++NOTE on prune_points() semantics (sugar_scene/sugar_model.py:819): the mask is a
++KEEP mask (True = keep); cf. drop_low_opacity_points(), which calls it with
++`strengths > threshold`.  All masks returned by this module are KEEP masks.
++"""
++
++import time
++
++import numpy as np
++
++try:  # torch is optional for the pure-numpy unit test path
++    import torch
++except Exception:  # pragma: no cover
++    torch = None
++
++from sklearn.cluster import DBSCAN
++from sklearn.neighbors import NearestNeighbors
++
++
++# --------------------------------------------------------------------------------------
++# eps estimation -- copied from 2D-SuGaR's estimate_eps(), with an added subsampling step
++# (the kNN graph of 400k+ points is what makes the original slow / memory hungry).
++# --------------------------------------------------------------------------------------
++def estimate_eps(points, min_samples=6, percentile=90, subsample=200_000, seed=0):
++    """Returns (eps, n_points_used). `points`: (N, 3) float array."""
++    points = np.asarray(points, dtype=np.float64)
++    n = len(points)
++    if n < 2:
++        return 0.0, n
++    k = int(min(min_samples, n))
++    if subsample is not None and 0 < subsample < n:
++        rng = np.random.default_rng(seed)
++        idx = rng.choice(n, size=int(subsample), replace=False)
++        pts = points[idx]
++    else:
++        pts = points
++    nbrs = NearestNeighbors(n_neighbors=min(k, len(pts))).fit(pts)
++    distances, _ = nbrs.kneighbors(pts)
++    k_distances = distances[:, -1]  # distance to the k-th neighbour
++    eps = float(np.percentile(k_distances, percentile))
++    return eps, int(len(pts))
++
++
++def _cluster_and_keep(points, rule, min_samples, knn_percentile, keep_cluster_min_frac,
++                      eps_estimate_subsample, seed=0, n_jobs=-1, eps=None):
++    """DBSCAN on `points` (N,3) -> (keep_mask (N,) bool, info dict).  KEEP mask."""
++    n = len(points)
++    info = {'n_points': int(n)}
++    if n == 0:
++        return np.zeros(0, dtype=bool), info
++    if eps is None:
++        eps, n_eps = estimate_eps(points, min_samples=min_samples,
++                                  percentile=knn_percentile,
++                                  subsample=eps_estimate_subsample, seed=seed)
++        info['n_points_for_eps_estimate'] = n_eps
++    info['eps'] = float(eps)
++    if eps <= 0:
++        # degenerate (duplicated points): keep everything
++        info['n_clusters'] = 1
++        info['n_clusters_kept'] = 1
++        info['n_noise'] = 0
++        info['cluster_sizes_top10'] = [int(n)]
++        return np.ones(n, dtype=bool), info
++
++    t0 = time.time()
++    labels = DBSCAN(eps=eps, min_samples=int(min_samples), n_jobs=n_jobs).fit_predict(points)
++    info['dbscan_seconds'] = float(time.time() - t0)
++
++    uniq, counts = np.unique(labels[labels >= 0], return_counts=True)
++    info['n_clusters'] = int(len(uniq))
++    info['n_noise'] = int((labels < 0).sum())
++    order = np.argsort(-counts)
++    info['cluster_sizes_top10'] = [int(c) for c in counts[order][:10]]
++
++    if len(uniq) == 0:
++        # everything is noise -> refuse to delete the whole thing
++        info['n_clusters_kept'] = 0
++        info['warning'] = 'DBSCAN labelled every point as noise; keeping all points.'
++        return np.ones(n, dtype=bool), info
++
++    if rule == 'largest':
++        kept_ids = {int(uniq[order[0]])}
++    elif rule == 'keep_large':
++        thr = float(keep_cluster_min_frac) * float(n)
++        kept_ids = set(int(c) for c, s in zip(uniq, counts) if s >= thr)
++        if not kept_ids:  # threshold above even the largest cluster
++            kept_ids = {int(uniq[order[0]])}
++        info['min_cluster_size_threshold'] = float(thr)
++    else:
++        raise ValueError(f"Unknown rule '{rule}' (expected 'largest' or 'keep_large').")
++
++    info['n_clusters_kept'] = int(len(kept_ids))
++    keep = np.isin(labels, list(kept_ids))
++    return keep, info
++
++
++def cluster_prune_mask(
++    points,
++    fg_bbox_min=None,
++    fg_bbox_max=None,
++    opacities=None,
++    rule='keep_large',
++    separate_fg_bg=True,
++    min_samples=6,
++    knn_percentile=90,
++    keep_cluster_min_frac=0.005,
++    eps_estimate_subsample=200_000,
++    opacity_min=0.0,
++    seed=0,
++    verbose=True,
++):
++    """Compute the DBSCAN keep-mask for a set of Gaussian centers.
++
++    Args:
++        points: (N, 3) numpy array (or torch tensor) of Gaussian centers.
++        fg_bbox_min / fg_bbox_max: (3,) arrays. Required if separate_fg_bg=True.
++        opacities: (N,) array of opacities (SuGaR `strengths[..., 0]`), or None.
++        rule: 'keep_large' (all clusters >= keep_cluster_min_frac * N) or
++              'largest' (2D-SuGaR original: only the biggest cluster).
++        opacity_min: points with opacity < this value do NOT take part in the
++              clustering but are never pruned either (they are kept as-is).
++
++    Returns:
++        keep_mask: (N,) bool numpy array, True = KEEP (prune_points() convention).
++        stats: dict, JSON-serialisable.
++    """
++    t_all = time.time()
++    if torch is not None and isinstance(points, torch.Tensor):
++        points = points.detach().cpu().numpy()
++    points = np.asarray(points, dtype=np.float64)
++    n_total = len(points)
++
++    stats = {
++        'n_total': int(n_total),
++        'rule': rule,
++        'separate_fg_bg': bool(separate_fg_bg),
++        'min_samples': int(min_samples),
++        'knn_percentile': float(knn_percentile),
++        'keep_cluster_min_frac': float(keep_cluster_min_frac),
++        'eps_estimate_subsample': int(eps_estimate_subsample) if eps_estimate_subsample else None,
++        'opacity_min': float(opacity_min),
++    }
++
++    # Points that participate in the clustering
++    if opacities is not None and opacity_min > 0:
++        if torch is not None and isinstance(opacities, torch.Tensor):
++            opacities = opacities.detach().cpu().numpy()
++        active = np.asarray(opacities).reshape(-1) >= opacity_min
++    else:
++        active = np.ones(n_total, dtype=bool)
++    stats['n_inactive_low_opacity_kept'] = int((~active).sum())
++
++    keep_mask = np.ones(n_total, dtype=bool)
++
++    if separate_fg_bg:
++        if fg_bbox_min is None or fg_bbox_max is None:
++            raise ValueError("separate_fg_bg=True requires fg_bbox_min and fg_bbox_max.")
++        fg_bbox_min = np.asarray(fg_bbox_min, dtype=np.float64).reshape(3)
++        fg_bbox_max = np.asarray(fg_bbox_max, dtype=np.float64).reshape(3)
++        in_fg = np.all(points > fg_bbox_min, axis=-1) & np.all(points < fg_bbox_max, axis=-1)
++        stats['fg_bbox_min'] = fg_bbox_min.tolist()
++        stats['fg_bbox_max'] = fg_bbox_max.tolist()
++        stats['n_fg'] = int(in_fg.sum())
++        stats['n_bg'] = int((~in_fg).sum())
++        groups = [('fg', in_fg & active), ('bg', (~in_fg) & active)]
++    else:
++        groups = [('all', active)]
++
++    for name, sel in groups:
++        idx = np.flatnonzero(sel)
++        if len(idx) == 0:
++            stats[name] = {'n_points': 0}
++            continue
++        keep_sub, info = _cluster_and_keep(
++            points[idx], rule=rule, min_samples=min_samples,
++            knn_percentile=knn_percentile,
++            keep_cluster_min_frac=keep_cluster_min_frac,
++            eps_estimate_subsample=eps_estimate_subsample, seed=seed)
++        keep_mask[idx] = keep_sub
++        info['n_pruned'] = int((~keep_sub).sum())
++        stats[name] = info
++        if verbose:
++            print(f"[cluster_prune] group={name}: n={info['n_points']} eps={info.get('eps'):.6g} "
++                  f"clusters={info.get('n_clusters')} kept={info.get('n_clusters_kept')} "
++                  f"noise={info.get('n_noise')} pruned={info['n_pruned']} "
++                  f"({info['n_pruned'] / max(info['n_points'], 1) * 100:.2f}%)")
++
++    n_pruned = int((~keep_mask).sum())
++    stats['n_pruned'] = n_pruned
++    stats['n_kept'] = int(n_total - n_pruned)
++    stats['pruned_ratio'] = float(n_pruned) / max(n_total, 1)
++    stats['total_seconds'] = float(time.time() - t_all)
++    stats['warning_high_prune_ratio'] = bool(stats['pruned_ratio'] > 0.30)
++    if stats['warning_high_prune_ratio'] and verbose:
++        print(f"[cluster_prune] WARNING: pruned {stats['pruned_ratio'] * 100:.2f}% of the "
++              f"Gaussians (>30%). eps is probably too small and is cutting the main body "
++              f"apart -- increase --knn_percentile or --min_samples, or check "
++              f"--separate_fg_bg.")
++    if verbose:
++        print(f"[cluster_prune] total: {n_total} -> {stats['n_kept']} "
++              f"(pruned {n_pruned}, {stats['pruned_ratio'] * 100:.2f}%) "
++              f"in {stats['total_seconds']:.1f}s")
++    return keep_mask, stats
+diff --git a/prune_coarse_model.py b/prune_coarse_model.py
+new file mode 100644
+index 0000000..c94bd71
+--- /dev/null
++++ b/prune_coarse_model.py
+@@ -0,0 +1,219 @@
++"""
++[ADDED - M2-B] Stand-alone pre-processing step: DBSCAN cluster pruning of a trained
++coarse SuGaR model.
++
++    coarse .pt  ->  load SuGaR  ->  DBSCAN on the Gaussian centers  ->  prune isolated
++    small clusters  ->  save a new .pt  ->  feed it to the UNMODIFIED extract_mesh.py
++                                            via `-m <out>.pt`.
++
++Zero coupling with the extraction side (nothing in extract_mesh.py /
++sugar_extractors/coarse_mesh.py is touched), which also makes the ablation trivial:
++extract once from the original .pt and once from the pruned .pt.
++
++Example:
++    python prune_coarse_model.py \
++        -s data/tandt/truck -c outputs/baseline/gs_truck/ -i 7000 \
++        -m outputs/runs/coarse_base_seed0/.../15000.pt --gpu 2 \
++        -o outputs/m2/pruned_default/15000_pruned.pt
++"""
++
++import argparse
++import json
++import os
++import time
++
++import numpy as np
++import torch
++from rich.console import Console
++
++from sugar_scene.gs_model import GaussianSplattingWrapper
++from sugar_scene.sugar_model import SuGaR
++from sugar_utils.general_utils import str2bool
++from sugar_utils.spherical_harmonics import SH2RGB
++from sugar_utils.cluster_prune import cluster_prune_mask
++
++
++# The loading path below is copied from sugar_extractors/coarse_mesh.py so that the
++# model we write back out is byte-compatible with what extract_mesh.py expects.
++def load_coarse_sugar(args, CONSOLE):
++    n_skip_images_for_eval_split = 8
++    CONSOLE.print(f"Loading the initial 3DGS model from path {args.checkpoint_path}...")
++    nerfmodel = GaussianSplattingWrapper(
++        source_path=args.scene_path,
++        output_path=args.checkpoint_path,
++        iteration_to_load=args.iteration_to_load,
++        load_gt_images=False,
++        eval_split=args.eval,
++        eval_split_interval=n_skip_images_for_eval_split,
++        )
++    CONSOLE.print(f'{len(nerfmodel.training_cameras)} training images detected.')
++
++    CONSOLE.print(f"\nLoading the coarse SuGaR model from path {args.coarse_model_path}...")
++    checkpoint = torch.load(args.coarse_model_path, map_location=nerfmodel.device)
++    colors = SH2RGB(checkpoint['state_dict']['_sh_coordinates_dc'][:, 0, :])
++    sugar = SuGaR(
++        nerfmodel=nerfmodel,
++        points=checkpoint['state_dict']['_points'],
++        colors=colors,
++        initialize=True,
++        sh_levels=nerfmodel.gaussians.active_sh_degree + 1,
++        keep_track_of_knn=True,
++        knn_to_track=16,
++        beta_mode='average',
++        primitive_types='diamond',
++        surface_mesh_to_bind=None,
++        )
++    sugar.load_state_dict(checkpoint['state_dict'])
++    sugar.eval()
++    return nerfmodel, sugar, checkpoint
++
++
++def main():
++    parser = argparse.ArgumentParser(
++        description='[M2-B] Prune isolated small DBSCAN clusters from a coarse SuGaR model.')
++    # --- same flags as extract_mesh.py for the model to load ---
++    parser.add_argument('-s', '--scene_path', type=str, required=True,
++                        help='Path to the scene data (COLMAP dataset).')
++    parser.add_argument('-c', '--checkpoint_path', type=str, required=True,
++                        help='Path to the vanilla 3DGS checkpoint directory.')
++    parser.add_argument('-i', '--iteration_to_load', type=int, default=7000,
++                        help='3DGS iteration to load.')
++    parser.add_argument('-m', '--coarse_model_path', type=str, required=True,
++                        help='Path to the coarse SuGaR .pt model to prune.')
++    parser.add_argument('--eval', type=str2bool, default=True,
++                        help='Use train/test split (must match the training run).')
++    parser.add_argument('--gpu', type=int, default=0, help='GPU index.')
++    # --- output ---
++    parser.add_argument('-o', '--output_path', type=str, required=True,
++                        help='Path of the pruned .pt to write. '
++                             '<out>_prune_stats.json is written next to it.')
++    # --- pruning hyper-parameters ---
++    parser.add_argument('--rule', type=str, default='keep_large',
++                        choices=['largest', 'keep_large'],
++                        help="'largest': 2D-SuGaR original, keep only the biggest cluster "
++                             "(failure-case control: deletes whole backgrounds). "
++                             "'keep_large' (default): keep every cluster of size >= "
++                             "keep_cluster_min_frac * N.")
++    parser.add_argument('--keep_cluster_min_frac', type=float, default=0.005,
++                        help="Minimum cluster size, as a fraction of the number of points "
++                             "in the group, for rule=keep_large.")
++    parser.add_argument('--separate_fg_bg', type=str2bool, default=True,
++                        help='Estimate eps and run DBSCAN separately inside/outside the '
++                             'foreground camera bbox (fg_bbox_factor=1, as in coarse_mesh.py).')
++    parser.add_argument('--fg_bbox_factor', type=float, default=1.,
++                        help='Foreground bbox factor (coarse_mesh.py uses 1.).')
++    parser.add_argument('--min_samples', type=int, default=6, help='DBSCAN min_samples.')
++    parser.add_argument('--knn_percentile', type=float, default=90,
++                        help='Percentile of the k-th NN distance used as eps.')
++    parser.add_argument('--eps_estimate_subsample', type=int, default=200000,
++                        help='Subsample size used when estimating eps (0 = no subsample).')
++    parser.add_argument('--opacity_min', type=float, default=0.,
++                        help='Points with opacity below this do not take part in the '
++                             'clustering, but are never pruned.')
++    parser.add_argument('--seed', type=int, default=0)
++    parser.add_argument('--verify_reload', type=str2bool, default=True,
++                        help='Self-check: reload the written .pt with coarse_mesh.py code path.')
++    args = parser.parse_args()
++
++    CONSOLE = Console(width=120)
++    torch.cuda.set_device(args.gpu)
++    t0 = time.time()
++
++    CONSOLE.print("-----[M2-B] Cluster pruning parameters-----")
++    for k, v in sorted(vars(args).items()):
++        CONSOLE.print(f"  {k}: {v}")
++    CONSOLE.print("-------------------------------------------")
++
++    nerfmodel, sugar, checkpoint = load_coarse_sugar(args, CONSOLE)
++    n_before = int(sugar.n_points)
++    CONSOLE.print(f"Coarse model loaded: {n_before} gaussians.")
++
++    # Foreground bbox, same convention as sugar_extractors/coarse_mesh.py
++    extent, avg_xyz = sugar.get_cameras_spatial_extent(return_average_xyz=True)
++    fg_min = (avg_xyz - args.fg_bbox_factor * extent * torch.ones(1, 3, device=sugar.device))
++    fg_max = (avg_xyz + args.fg_bbox_factor * extent * torch.ones(1, 3, device=sugar.device))
++
++    t_prune = time.time()
++    keep_mask, stats = cluster_prune_mask(
++        points=sugar.points,
++        fg_bbox_min=fg_min.flatten().cpu().numpy(),
++        fg_bbox_max=fg_max.flatten().cpu().numpy(),
++        opacities=sugar.strengths[..., 0],
++        rule=args.rule,
++        separate_fg_bg=args.separate_fg_bg,
++        min_samples=args.min_samples,
++        knn_percentile=args.knn_percentile,
++        keep_cluster_min_frac=args.keep_cluster_min_frac,
++        eps_estimate_subsample=(args.eps_estimate_subsample if args.eps_estimate_subsample > 0 else None),
++        opacity_min=args.opacity_min,
++        seed=args.seed,
++        verbose=True,
++        )
++    prune_seconds = time.time() - t_prune
++
++    # prune_points() takes a KEEP mask (sugar_scene/sugar_model.py:819, cf.
++    # drop_low_opacity_points which passes `strengths > threshold`).
++    sugar.prune_points(torch.tensor(keep_mask, dtype=torch.bool, device=sugar.device))
++    n_after = int(sugar.n_points)
++    CONSOLE.print(f"Pruned model: {n_before} -> {n_after} gaussians.")
++
++    os.makedirs(os.path.dirname(os.path.abspath(args.output_path)), exist_ok=True)
++    # Same save format as sugar_trainers/coarse_density.py (SuGaR.save_model ->
++    # {'state_dict': ...}), which is what coarse_mesh.py loads.
++    sugar.save_model(
++        path=args.output_path,
++        pruned_from=args.coarse_model_path,
++        prune_stats=stats,
++        iteration=checkpoint.get('iteration', None),
++        epoch=checkpoint.get('epoch', None),
++        )
++    CONSOLE.print(f"Pruned model saved to {args.output_path}")
++
++    stats.update({
++        'coarse_model_path': args.coarse_model_path,
++        'output_path': args.output_path,
++        'scene_path': args.scene_path,
++        'gs_checkpoint_path': args.checkpoint_path,
++        'iteration_to_load': int(args.iteration_to_load),
++        'gpu_index': int(args.gpu),
++        'fg_bbox_factor': float(args.fg_bbox_factor),
++        'cameras_spatial_extent': float(extent),
++        'camera_average_xyz': [float(v) for v in avg_xyz.flatten().tolist()],
++        'n_gaussians_before': n_before,
++        'n_gaussians_after': n_after,
++        'prune_seconds': float(prune_seconds),
++        'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
++    })
++
++    # ---- self-check: can the freshly written .pt be reloaded by coarse_mesh.py's path?
++    if args.verify_reload:
++        CONSOLE.print("\n[self-check] Reloading the pruned model with the coarse_mesh.py code path...")
++        ck = torch.load(args.output_path, map_location=nerfmodel.device)
++        colors = SH2RGB(ck['state_dict']['_sh_coordinates_dc'][:, 0, :])
++        sugar2 = SuGaR(
++            nerfmodel=nerfmodel,
++            points=ck['state_dict']['_points'],
++            colors=colors,
++            initialize=True,
++            sh_levels=nerfmodel.gaussians.active_sh_degree + 1,
++            keep_track_of_knn=True, knn_to_track=16,
++            beta_mode='average', primitive_types='diamond', surface_mesh_to_bind=None,
++            )
++        sugar2.load_state_dict(ck['state_dict'])
++        sugar2.eval()
++        ok = int(sugar2.n_points) == n_after
++        CONSOLE.print(f"[self-check] reloaded {int(sugar2.n_points)} gaussians "
++                      f"(expected {n_after}) -> {'OK' if ok else 'MISMATCH'}")
++        stats['reload_self_check_ok'] = bool(ok)
++        stats['reload_n_points'] = int(sugar2.n_points)
++
++    stats['total_seconds_script'] = float(time.time() - t0)
++    stats_path = os.path.splitext(args.output_path)[0] + '_prune_stats.json'
++    with open(stats_path, 'w') as f:
++        json.dump(stats, f, indent=2)
++    CONSOLE.print(f"[STATS] {stats_path}")
++    CONSOLE.print(json.dumps(stats, indent=2))
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/scripts/test_cluster_prune.py b/scripts/test_cluster_prune.py
+new file mode 100644
+index 0000000..1c5a89f
+--- /dev/null
++++ b/scripts/test_cluster_prune.py
+@@ -0,0 +1,110 @@
++"""[ADDED - M2-B] CPU-only synthetic unit test for sugar_utils/cluster_prune.py."""
++import os
++import sys
++
++import numpy as np
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++from sugar_utils.cluster_prune import cluster_prune_mask  # noqa: E402
++
++
++def make_scene_a(seed=0):
++    """One big blob (50k) + 20 far-away tiny clusters (30 pts each) + 200 uniform noise pts."""
++    rng = np.random.default_rng(seed)
++    big = rng.normal(0, 0.3, size=(50_000, 3))
++    labels = np.zeros(len(big), dtype=int)  # 0 = main body
++    smalls = []
++    for i in range(20):
++        c = rng.uniform(-8, 8, size=3)
++        c = c + 6.0 * np.sign(c)  # push far away from the main blob
++        smalls.append(rng.normal(0, 0.05, size=(30, 3)) + c)
++    smalls = np.concatenate(smalls, 0)
++    noise = rng.uniform(-15, 15, size=(200, 3))
++    pts = np.concatenate([big, smalls, noise], 0)
++    labels = np.concatenate([np.zeros(len(big), int),
++                             np.ones(len(smalls), int),
++                             2 * np.ones(len(noise), int)])
++    return pts, labels  # 0=main, 1=small clusters, 2=noise
++
++
++def make_scene_b(seed=1):
++    """Dense foreground + sparse background (the Truck-like case for separate_fg_bg)."""
++    rng = np.random.default_rng(seed)
++    fg = rng.normal(0, 0.5, size=(40_000, 3))              # dense, inside bbox (|x|<2)
++    # sparse background shell, well outside the fg bbox
++    dirs = rng.normal(size=(4_000, 3))
++    dirs /= np.linalg.norm(dirs, axis=1, keepdims=True)
++    bg = dirs * rng.uniform(6.0, 12.0, size=(4_000, 1))
++    pts = np.concatenate([fg, bg], 0)
++    labels = np.concatenate([np.zeros(len(fg), int), np.ones(len(bg), int)])
++    bbox_min = np.array([-2., -2., -2.])
++    bbox_max = np.array([2., 2., 2.])
++    return pts, labels, bbox_min, bbox_max
++
++
++def report(name, keep, labels, names):
++    print(f"  -> {name}: kept {keep.sum()}/{len(keep)} "
++          f"(pruned {(~keep).sum()}, {(~keep).mean()*100:.2f}%)")
++    for v, nm in enumerate(names):
++        sel = labels == v
++        if sel.sum():
++            print(f"       {nm:<22s} n={sel.sum():6d}  kept={keep[sel].sum():6d}  "
++                  f"pruned={(~keep[sel]).sum():6d} ({(~keep[sel]).mean()*100:6.2f}%)")
++
++
++def main():
++    print("=" * 90)
++    print("TEST 1 -- big blob + 20 tiny far clusters + 200 uniform noise points")
++    print("=" * 90)
++    pts, labels = make_scene_a()
++    names = ['main body (50000)', 'small clusters (600)', 'uniform noise (200)']
++    bbox_min, bbox_max = np.array([-3.] * 3), np.array([3.] * 3)
++
++    for rule in ['keep_large', 'largest']:
++        keep, st = cluster_prune_mask(pts, bbox_min, bbox_max, rule=rule,
++                                      separate_fg_bg=False, verbose=False)
++        print(f"\n[rule={rule}, separate_fg_bg=False] eps={st['all']['eps']:.4g} "
++              f"clusters={st['all']['n_clusters']} kept_clusters={st['all']['n_clusters_kept']} "
++              f"noise={st['all']['n_noise']} sizes_top5={st['all']['cluster_sizes_top10'][:5]}")
++        report(rule, keep, labels, names)
++        # NOTE: a Gaussian blob has thin tails, so DBSCAN always labels a few percent of
++        # the outermost main-body points as noise. We require >=90% of the main body to
++        # survive, and 100% of the small clusters / uniform noise to be removed.
++        main_kept = keep[labels == 0].mean()
++        ok = (main_kept >= 0.90) and (not keep[labels == 1].any()) and (not keep[labels == 2].any())
++        print(f"     EXPECTED: main body >=90% kept (got {main_kept*100:.2f}%), small clusters "
++              f"+ noise 100% pruned -> {'PASS' if ok else 'FAIL'}")
++
++    print()
++    print("=" * 90)
++    print("TEST 2 -- dense foreground (40000) + sparse background shell (4000)")
++    print("=" * 90)
++    pts, labels, bbox_min, bbox_max = make_scene_b()
++    names = ['foreground (dense)', 'background (sparse)']
++    for sep in [True, False]:
++        keep, st = cluster_prune_mask(pts, bbox_min, bbox_max, rule='keep_large',
++                                      separate_fg_bg=sep, verbose=False)
++        if sep:
++            print(f"\n[separate_fg_bg=True]  eps_fg={st['fg']['eps']:.4g} "
++                  f"(clusters={st['fg']['n_clusters']}, noise={st['fg']['n_noise']})  "
++                  f"eps_bg={st['bg']['eps']:.4g} "
++                  f"(clusters={st['bg']['n_clusters']}, noise={st['bg']['n_noise']})")
++        else:
++            print(f"\n[separate_fg_bg=False] eps_global={st['all']['eps']:.4g} "
++                  f"clusters={st['all']['n_clusters']} noise={st['all']['n_noise']} "
++                  f"sizes_top5={st['all']['cluster_sizes_top10'][:5]}")
++        report(f"separate_fg_bg={sep}", keep, labels, names)
++        bg_pruned = (~keep[labels == 1]).mean()
++        print(f"     background pruned ratio = {bg_pruned*100:.2f}%  "
++              f"| total pruned {st['pruned_ratio']*100:.2f}% "
++              f"| >30% warning flag = {st['warning_high_prune_ratio']}")
++        if sep:
++            print(f"     EXPECTED: background survives -> "
++                  f"{'PASS' if bg_pruned < 0.10 else 'FAIL'}")
++        else:
++            print(f"     EXPECTED: global eps wipes out the sparse background -> "
++                  f"{'PASS (background destroyed, as predicted)' if bg_pruned > 0.5 else 'NOTE: background survived even without the fg/bg split'}")
++
++
++if __name__ == '__main__':
++    main()

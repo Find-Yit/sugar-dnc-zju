@@ -1,0 +1,118 @@
+{
+  "run_name": "m_base_d10_q01",
+  "cameras_extent": 5.847915220260621,
+  "cameras_average_center": [
+    0.08619994670152664,
+    -0.007175730541348457,
+    0.1516958326101303
+  ],
+  "fg_bbox_min": [
+    -5.761715273559094,
+    -5.855090950801969,
+    -5.6962193876504905
+  ],
+  "fg_bbox_max": [
+    5.9341151669621475,
+    5.840739489719272,
+    5.999611052870751
+  ],
+  "G1_sparse_to_mesh_distance": {
+    "n_reference_points": 88066,
+    "mean_abs": 0.010347210972844434,
+    "median_abs": 0.004049293696880341,
+    "p90_abs": 0.019349295645952225,
+    "mean_rel": 0.0017693845726414782,
+    "median_rel": 0.0006924337211406902,
+    "p90_rel": 0.003308751053523292
+  },
+  "G2_precision_ratio": {
+    "tau_0p5pct_abs": 0.029239576101303105,
+    "ratio_below_0p5pct": 0.9414757113982695,
+    "tau_1pct_abs": 0.05847915220260621,
+    "ratio_below_1pct": 0.9773011150727863
+  },
+  "G3_mesh_vertex_to_sparse_distance": {
+    "n_vertices_all": 205283,
+    "mean_abs_all_vertices": 5.75056460273968,
+    "median_abs_all_vertices": 0.48958183926954946,
+    "mean_rel_all_vertices": 0.983352936242362,
+    "n_vertices_in_fg_bbox": 103247,
+    "mean_abs_fg_vertices": 0.10650811128040291,
+    "median_abs_fg_vertices": 0.07586869414138955,
+    "mean_rel_fg_vertices": 0.018213005364954012,
+    "note": "COLMAP 稀疏点本身稀疏（非稠密真值），该指标只作参考，不能单独判优劣"
+  },
+  "G4_topology": {
+    "n_vertices": 205283,
+    "n_unique_vertex_positions": 205283,
+    "n_duplicated_vertex_positions": 0,
+    "n_faces": 370284,
+    "n_nan_vertices": 0,
+    "n_connected_components": 2184,
+    "largest_component_faces": 156643,
+    "largest_component_face_ratio": 0.4230347517040974,
+    "n_fragment_components_lt_100_faces": 2094,
+    "fragment_faces_total": 28033,
+    "n_unique_edges": 574651,
+    "n_boundary_edges": 38450,
+    "n_non_manifold_edges": 0,
+    "n_non_manifold_edges_open3d": 0,
+    "n_edges_used_by_2_faces": 536201
+  },
+  "G5_normal_smoothness": {
+    "n_adjacent_face_pairs": 536201,
+    "dihedral_deg_mean": 45.94099225714643,
+    "dihedral_deg_median": 31.287004507432282,
+    "dihedral_deg_p90": 112.8077667955152,
+    "dihedral_abs_deg_mean": 33.59158114267131,
+    "dihedral_abs_deg_median": 27.311465195564285,
+    "dihedral_abs_deg_p90": 75.15585420979212,
+    "frac_raw_gt_90deg": 0.16191129818855243,
+    "histogram_deg_bin10_counts": [
+      123611,
+      79713,
+      58096,
+      46332,
+      38428,
+      32570,
+      27619,
+      23570,
+      19445,
+      16487,
+      13415,
+      10880,
+      9064,
+      7617,
+      6773,
+      6510,
+      6547,
+      9524
+    ],
+    "note": "raw=面法向夹角（依赖绕序）；abs=min(raw,180-raw)（与绕序无关）。histogram 是 raw 的 18 个 10 度分箱计数，用来看有没有 180 度假峰"
+  },
+  "metric_directions": {
+    "G1_*": "down",
+    "G2_*": "up",
+    "G3_*": "down",
+    "G4_largest_component_face_ratio": "up",
+    "G4_n_connected_components": "down",
+    "G4_n_fragment_components": "down",
+    "G5_dihedral_deg_mean": "down (但过低可能是过度平滑)"
+  },
+  "config": {
+    "scene_path": "/scratch/users/nus/e1351071/test_zju/data/tandt/truck",
+    "mesh_path": "/scratch/users/nus/e1351071/test_zju/outputs/m/mesh_base_d10_q01/sugarmesh_3Dgs7000_densityestim02_sdfnorm02_level03_decim200000.ply",
+    "mesh_file_bytes": 15283451,
+    "gs_checkpoint": "/scratch/users/nus/e1351071/test_zju/outputs/baseline/gs_truck",
+    "eval_split_interval": 8,
+    "min_track_length": 3,
+    "fg_bbox_factor": 1.0,
+    "center_bbox": true,
+    "fragment_face_threshold": 100,
+    "extent_source": "computed from 219 training cameras (SuGaR get_cameras_spatial_extent)",
+    "n_colmap_points_total": 136029,
+    "n_colmap_points_track_ok": 123843,
+    "n_colmap_points_kept": 88066
+  },
+  "wall_clock_sec": 9.32
+}

@@ -1,0 +1,1 @@
+m2p95_bg9_q0|2|/scratch/users/nus/e1351071/test_zju/outputs/m2/pruned_p95/15000_pruned.pt|--poisson_depth 10 --poisson_depth_bg 9 --vertices_density_quantile 0 --extract_seed 0

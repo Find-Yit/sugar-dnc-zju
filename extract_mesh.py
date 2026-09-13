@@ -62,6 +62,30 @@ if __name__ == "__main__":
                         help="If True, only load the model, compute + print + dump the automatic Poisson "
                              "depth to <mesh_output_dir>/extract_stats.json, then exit without extracting.")
     
+
+    # ----- [M1+ 自有改动，区别于 Frosting 原版] -----
+    # Frosting 只估一个 D（前景高斯中心），前景/背景共用，上限写死 10。
+    # M1+a: --poisson_depth_bg 让背景单独估 D（背景点更稀疏，应得更小的 D）。
+    # M1+b: --depth_estimate_source surface 改用真正送进 Poisson 的表面采样点估 D，
+    #       而不是高斯中心；公式（knn K=2 平方距离 / bbox 的 10% 分位 -> floor(-log2(100*d))）不变。
+    # --max_poisson_depth 解开 Frosting 写死的 10 上限；--extract_seed 让 randperm 可复现。
+    parser.add_argument('--poisson_depth_bg', type=str, default='same',
+                        help="[M1+a] Octree depth for the BACKGROUND Poisson reconstruction. "
+                             "'same' (default) = original behaviour, reuse the foreground depth; "
+                             "an integer; or 'auto' to estimate it from background points only.")
+    parser.add_argument('--depth_estimate_source', type=str, default='centers',
+                        choices=['centers', 'surface'],
+                        help="[M1+b] What points the automatic depth is estimated from. "
+                             "'centers' (default) = Gaussian centers, exactly like Frosting. "
+                             "'surface' = the surface samples actually fed to Poisson "
+                             "(fg_pcd / bg_pcd source points, subsampled to <=500k).")
+    parser.add_argument('--max_poisson_depth', type=int, default=10,
+                        help="[M1+] Upper bound of the automatic Poisson depth (Frosting hard-codes 10).")
+    parser.add_argument('--extract_seed', type=int, default=-1,
+                        help="[M1+] Random seed for the extraction. -1 (default) = do not seed "
+                             "(original behaviour). >=0 seeds torch / cuda / numpy / random so that "
+                             "the randperm subsampling of surface points is reproducible.")
+
     args = parser.parse_args()
     
     # Call function

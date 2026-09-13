@@ -1,0 +1,13 @@
+{
+  "tag": "base_d10_q01",
+  "n_components": 2184,
+  "n_fragments_lt100": 2094,
+  "largest_component_faces": 156643,
+  "largest_component_ratio": 0.4230347517040974,
+  "frag_pixel_ratio": {
+    "view00": 0.011752292651169055,
+    "view08": 0.019499227364395903,
+    "view16": 0.008759031230941343,
+    "view24": 0.003442250633261869
+  }
+}

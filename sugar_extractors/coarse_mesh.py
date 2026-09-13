@@ -99,6 +99,112 @@ def compute_optimal_poisson_depth(
     return poisson_depth
 
 
+# ---------------------------------------------------------------------------
+# [M1+ : 自有改动，区别于 Frosting 原版]
+# Frosting 原版只估计 *一个* D（前景高斯中心的最近邻分位数），前景/背景共用，且样本
+# 永远是高斯中心。实测 Truck 上 raw=10.87 被 max_poisson_depth=10 截断 => 零收益。
+# M1+a：前景 / 背景各自估 D（背景点更稀疏，应得到更小的 D）。
+# M1+b：`--depth_estimate_source surface` 改用真正送进 Poisson 的表面采样点来估计，
+#       而不是高斯中心；表面点密度才是 Poisson 八叉树真正面对的密度。
+# 公式与 Frosting 完全一致（knn_points K=2 的 *平方* 距离、不开方、除以 bbox 尺寸、
+# D = min(floor(-log2(ratio * d_q)), max_poisson_depth)），只是换了样本集合。
+# ---------------------------------------------------------------------------
+def compute_poisson_depth_from_points(
+    points: torch.Tensor,
+    cell_size_nn_distance_ratio: float = 100.,
+    max_poisson_depth: int = 10,
+    quantile_to_use: float = 0.1,
+    max_points_for_knn: int = 500_000,
+    tag: str = '',
+    ):
+    """[自有改动] 对任意一组点（高斯中心 或 表面采样点）套用 Frosting 的 D 公式。
+
+    points: (N, 3) tensor. 超过 max_points_for_knn 时随机子采样（受 --extract_seed 控制）。
+    返回 (poisson_depth:int, details:dict)。
+    """
+    n_points_total = int(points.shape[0])
+    if n_points_total < 2:
+        return None, {'tag': tag, 'n_points_total': n_points_total, 'error': 'not enough points'}
+
+    pts = points
+    n_subsampled = n_points_total
+    if n_points_total > max_points_for_knn:
+        idx = torch.randperm(n_points_total, device=pts.device)[:max_points_for_knn]
+        pts = pts[idx]
+        n_subsampled = int(pts.shape[0])
+
+    # bbox 用这组点自己的包围盒（Frosting 用 1.1 * 最大边长）
+    bbox_size = 1.1 * (pts.max(dim=0)[0] - pts.min(dim=0)[0]).max().item()
+
+    # 与 Frosting 一致：knn_points 返回的是 *平方* 距离，不开方
+    nn_dists = knn_points(pts[None].float(), pts[None].float(), K=2).dists[0, ..., 1]
+    norm_nn_dists = nn_dists / bbox_size
+    quantile_dist = norm_nn_dists.quantile(quantile_to_use).item()
+
+    raw_depth = -np.log2(cell_size_nn_distance_ratio * quantile_dist)
+    poisson_depth = int(min(int(np.floor(raw_depth)), int(max_poisson_depth)))
+
+    details = {
+        'tag': tag,
+        'n_points_total': n_points_total,
+        'n_points_used_for_knn': n_subsampled,
+        'max_points_for_knn': int(max_points_for_knn),
+        'bbox_size': float(bbox_size),
+        'quantile_to_use': float(quantile_to_use),
+        'quantile_dist_normalized_SQUARED': float(quantile_dist),
+        'cell_size_nn_distance_ratio': float(cell_size_nn_distance_ratio),
+        'max_poisson_depth': int(max_poisson_depth),
+        'raw_depth_before_floor': float(raw_depth),
+        'poisson_depth': int(poisson_depth),
+        'nn_dist_note': 'knn_points returns SQUARED distances (pytorch3d), kept as-is like Frosting',
+    }
+    return poisson_depth, details
+
+
+def compute_optimal_poisson_depth_bg(
+    sugar: SuGaR,
+    cell_size_nn_distance_ratio: float = 100.,
+    max_poisson_depth: int = 10,
+    fg_bbox_factor: float = 1.,
+    bg_bbox_factor: float = 4.,
+    opacity_threshold: float = 0.5,
+    quantile_to_use: float = 0.1,
+    max_points_for_knn: int = 500_000,
+    ):
+    """[自有改动 M1+a] 用 *背景* 高斯中心估 D_bg。
+
+    背景集合 = (bg bbox 内) AND (fg bbox 外) AND (opacity > 0.5)，
+    与 extract_mesh_from_coarse_sugar 里划分 fg_mask / bg_mask 的规则一致；
+    bbox_size 用背景点自己的包围盒。Frosting 原版没有这一步。
+    """
+    _cameras_spatial_extent, _camera_average_xyz = sugar.get_cameras_spatial_extent(return_average_xyz=True)
+    fg_bbox_min_tensor = _camera_average_xyz - fg_bbox_factor * _cameras_spatial_extent * torch.ones(1, 3, device=sugar.device)
+    fg_bbox_max_tensor = _camera_average_xyz + fg_bbox_factor * _cameras_spatial_extent * torch.ones(1, 3, device=sugar.device)
+    fg_mask = (sugar.points > fg_bbox_min_tensor).all(dim=-1) * (sugar.points < fg_bbox_max_tensor).all(dim=-1)
+    bg_mask = ((sugar.points - _camera_average_xyz).abs().max(dim=-1)[0] < bg_bbox_factor * _cameras_spatial_extent) * ~fg_mask
+    opacity_mask = sugar.strengths[..., 0] > opacity_threshold
+    mask = opacity_mask * bg_mask
+
+    depth, details = compute_poisson_depth_from_points(
+        sugar.points[mask],
+        cell_size_nn_distance_ratio=cell_size_nn_distance_ratio,
+        max_poisson_depth=max_poisson_depth,
+        quantile_to_use=quantile_to_use,
+        max_points_for_knn=max_points_for_knn,
+        tag='bg_centers',
+        )
+    details.update({
+        'fg_bbox_factor': float(fg_bbox_factor),
+        'bg_bbox_factor': float(bg_bbox_factor),
+        'opacity_threshold': float(opacity_threshold),
+        'cameras_spatial_extent': float(_cameras_spatial_extent),
+        'n_gaussians_total': int(sugar.points.shape[0]),
+        'n_gaussians_bg_bbox': int(bg_mask.sum().item()),
+        'n_gaussians_used': int(mask.sum().item()),
+    })
+    return depth, details
+
+
 def extract_mesh_from_coarse_sugar(args):
     CONSOLE = Console(width=120)
     
@@ -149,9 +255,45 @@ def extract_mesh_from_coarse_sugar(args):
     vertices_density_quantile = float(getattr(args, 'vertices_density_quantile', 0.1))
     cell_size_nn_distance_ratio = float(getattr(args, 'cell_size_nn_distance_ratio', 100.))
     only_report_depth = bool(getattr(args, 'only_report_depth', False))
+
+    # ---- [M1+ 自有改动，区别于 Frosting 原版] ----
+    # --max_poisson_depth   : Frosting 写死 10 的上限，现在可调（Truck raw=10.87 被 10 截断）。
+    # --poisson_depth_bg    : 背景单独的 D。'same'(默认)=原版行为，与前景共用；整数或 'auto'。
+    # --depth_estimate_source: 'centers'(默认, Frosting 原样，用高斯中心) 或 'surface'
+    #                          (用真正送进 Poisson 的表面采样点，前景/背景各自估)。
+    # --extract_seed        : >=0 时给 torch/np/random 播种，使表面点 randperm 可复现。
+    max_poisson_depth = int(getattr(args, 'max_poisson_depth', 10))
+    poisson_depth_bg_arg = str(getattr(args, 'poisson_depth_bg', 'same')).strip()
+    _bg_low = poisson_depth_bg_arg.lower()
+    use_same_depth_for_bg = _bg_low in ('same', '')
+    use_auto_poisson_depth_bg = _bg_low in ('auto', '-1')
+    depth_estimate_source = str(getattr(args, 'depth_estimate_source', 'centers')).strip().lower()
+    if depth_estimate_source not in ('centers', 'surface'):
+        raise ValueError(f"--depth_estimate_source must be 'centers' or 'surface', got {depth_estimate_source}")
+    use_surface_depth_estimate = (depth_estimate_source == 'surface')
+    extract_seed = int(getattr(args, 'extract_seed', -1))
+    if extract_seed >= 0:
+        import random as _random
+        torch.manual_seed(extract_seed)
+        torch.cuda.manual_seed_all(extract_seed)
+        np.random.seed(extract_seed)
+        _random.seed(extract_seed)
+
+    # 实际用于 fg / bg Poisson 的两个深度（bg 默认跟随 fg = 原版行为）
+    poisson_depth_fg = poisson_depth
+    poisson_depth_bg = poisson_depth
+    if not (use_same_depth_for_bg or use_auto_poisson_depth_bg):
+        poisson_depth_bg = int(poisson_depth_bg_arg)
+
     extract_stats = {
         'poisson_depth_arg': poisson_depth_arg,
         'poisson_depth_is_auto': bool(use_auto_poisson_depth),
+        'poisson_depth_bg_arg': poisson_depth_bg_arg,
+        'poisson_depth_bg_is_auto': bool(use_auto_poisson_depth_bg),
+        'poisson_depth_bg_is_same_as_fg': bool(use_same_depth_for_bg),
+        'depth_estimate_source': depth_estimate_source,
+        'max_poisson_depth': max_poisson_depth,
+        'extract_seed': extract_seed,
         'vertices_density_quantile': vertices_density_quantile,
         'cell_size_nn_distance_ratio': cell_size_nn_distance_ratio,
         'only_report_depth': only_report_depth,
@@ -242,6 +384,10 @@ def extract_mesh_from_coarse_sugar(args):
     CONSOLE.print("Vertices density quantile (cleaning quantile):", vertices_density_quantile)  # [ADDED]
     CONSOLE.print("Cell size / NN distance ratio (auto depth only):", cell_size_nn_distance_ratio)  # [ADDED]
     CONSOLE.print("Only report depth (no extraction):", only_report_depth)  # [ADDED]
+    CONSOLE.print("[M1+] Background poisson depth arg:", poisson_depth_bg_arg)
+    CONSOLE.print("[M1+] Depth estimate source:", depth_estimate_source)
+    CONSOLE.print("[M1+] Max poisson depth:", max_poisson_depth)
+    CONSOLE.print("[M1+] Extract seed:", extract_seed)
     CONSOLE.print("--------------------")
     
     # Set the GPU
@@ -313,25 +459,54 @@ def extract_mesh_from_coarse_sugar(args):
     # [ADDED] Frosting-style automatic Poisson depth. Computed here, i.e. BEFORE the
     # low-opacity pruning below, exactly like Frosting (coarse_shell.py:234-240) -- the
     # function applies its own opacity_threshold=0.5 mask internally.
-    if use_auto_poisson_depth or only_report_depth:
-        CONSOLE.print("Computing optimal poisson depth...")
+    _need_centers_estimate = only_report_depth or (
+        (use_auto_poisson_depth or use_auto_poisson_depth_bg) and not use_surface_depth_estimate)
+    if _need_centers_estimate:
+        # --- fg：Frosting 原样（高斯中心） ---
+        CONSOLE.print("Computing optimal poisson depth (fg, centers)...")
         _auto_depth, _auto_details = compute_optimal_poisson_depth(
             sugar,
             cell_size_nn_distance_ratio=cell_size_nn_distance_ratio,
+            max_poisson_depth=max_poisson_depth,
             return_details=True,
             )
-        CONSOLE.print("Optimal poisson depth:", _auto_depth)
+        CONSOLE.print("Optimal poisson depth (fg, centers):", _auto_depth)
         CONSOLE.print("  -> details:", _auto_details)
         extract_stats['auto_poisson_depth'] = int(_auto_depth)
         extract_stats['auto_depth_details'] = _auto_details
-        if use_auto_poisson_depth:
-            poisson_depth = int(_auto_depth)
-    extract_stats['poisson_depth_used'] = int(poisson_depth)
+        extract_stats['depth_fg_centers'] = int(_auto_depth)
+        extract_stats['depth_fg_centers_details'] = _auto_details
+        # --- bg：[M1+a 自有改动] 背景高斯中心单独估 D ---
+        CONSOLE.print("[M1+a] Computing optimal poisson depth (bg, centers)...")
+        _auto_depth_bg, _auto_details_bg = compute_optimal_poisson_depth_bg(
+            sugar,
+            cell_size_nn_distance_ratio=cell_size_nn_distance_ratio,
+            max_poisson_depth=max_poisson_depth,
+            fg_bbox_factor=fg_bbox_factor,
+            bg_bbox_factor=bg_bbox_factor,
+            )
+        CONSOLE.print("[M1+a] Optimal poisson depth (bg, centers):", _auto_depth_bg)
+        CONSOLE.print("  -> details:", _auto_details_bg)
+        extract_stats['depth_bg_centers'] = None if _auto_depth_bg is None else int(_auto_depth_bg)
+        extract_stats['depth_bg_centers_details'] = _auto_details_bg
+
+        if not use_surface_depth_estimate:
+            if use_auto_poisson_depth:
+                poisson_depth = int(_auto_depth)
+                poisson_depth_fg = int(_auto_depth)
+                if use_same_depth_for_bg:
+                    poisson_depth_bg = int(_auto_depth)
+            if use_auto_poisson_depth_bg and _auto_depth_bg is not None:
+                poisson_depth_bg = int(_auto_depth_bg)
+
+    extract_stats['poisson_depth_used'] = int(poisson_depth_fg)
+    extract_stats['poisson_depth_fg_used'] = int(poisson_depth_fg)
+    extract_stats['poisson_depth_bg_used'] = int(poisson_depth_bg)
     _stats_path = os.path.join(mesh_output_dir, 'extract_stats.json')
     with open(_stats_path, 'w') as _f:
         json.dump(extract_stats, _f, indent=2)
     CONSOLE.print("Extraction stats written to", _stats_path)
-    if only_report_depth:
+    if only_report_depth and not use_surface_depth_estimate:
         CONSOLE.print("[only_report_depth=True] Skipping the actual mesh extraction.")
         return []
 
@@ -518,6 +693,41 @@ def extract_mesh_from_coarse_sugar(args):
 
                 CONSOLE.print("Foreground points:", fg_points.shape, fg_colors.shape, fg_normals.shape)
                 CONSOLE.print("Background points:", bg_points.shape, bg_colors.shape, bg_normals.shape)
+
+                # ---- [M1+b 自有改动，Frosting 原版没有] ----
+                # 用真正送进 Poisson 的表面采样点（fg_points / bg_points，即 fg_pcd / bg_pcd 的
+                # 来源 tensor）分别估 D_fg / D_bg：随机子采样 <=50 万点，knn_points K=2 取平方
+                # 距离的 10% 分位数，除以各自包围盒尺寸，再套 Frosting 的 D 公式。
+                if use_surface_depth_estimate or only_report_depth:
+                    _d_fg_s, _det_fg_s = compute_poisson_depth_from_points(
+                        fg_points, cell_size_nn_distance_ratio=cell_size_nn_distance_ratio,
+                        max_poisson_depth=max_poisson_depth, tag='fg_surface')
+                    _d_bg_s, _det_bg_s = compute_poisson_depth_from_points(
+                        bg_points, cell_size_nn_distance_ratio=cell_size_nn_distance_ratio,
+                        max_poisson_depth=max_poisson_depth, tag='bg_surface')
+                    CONSOLE.print("[M1+b] Poisson depth (fg, surface):", _d_fg_s, _det_fg_s)
+                    CONSOLE.print("[M1+b] Poisson depth (bg, surface):", _d_bg_s, _det_bg_s)
+                    extract_stats['depth_fg_surface'] = None if _d_fg_s is None else int(_d_fg_s)
+                    extract_stats['depth_fg_surface_details'] = _det_fg_s
+                    extract_stats['depth_bg_surface'] = None if _d_bg_s is None else int(_d_bg_s)
+                    extract_stats['depth_bg_surface_details'] = _det_bg_s
+
+                    if use_surface_depth_estimate:
+                        if use_auto_poisson_depth and _d_fg_s is not None:
+                            poisson_depth_fg = int(_d_fg_s)
+                            if use_same_depth_for_bg:
+                                poisson_depth_bg = int(_d_fg_s)
+                        if use_auto_poisson_depth_bg and _d_bg_s is not None:
+                            poisson_depth_bg = int(_d_bg_s)
+                    extract_stats['poisson_depth_fg_used'] = int(poisson_depth_fg)
+                    extract_stats['poisson_depth_bg_used'] = int(poisson_depth_bg)
+                    extract_stats['poisson_depth_used'] = int(poisson_depth_fg)
+                    with open(os.path.join(mesh_output_dir, 'extract_stats.json'), 'w') as _f:
+                        json.dump(extract_stats, _f, indent=2)
+                    if only_report_depth:
+                        CONSOLE.print("[only_report_depth=True] Depths reported, skipping mesh extraction.")
+                        return []
+                CONSOLE.print("[M1+] Poisson depth used -> fg:", poisson_depth_fg, " bg:", poisson_depth_bg)
                 
                 # ---Compute foreground mesh---
                 CONSOLE.print("\n-----Foreground mesh-----")
@@ -537,7 +747,7 @@ def extract_mesh_from_coarse_sugar(args):
 
                     CONSOLE.print("Now computing mesh...")
                     o3d_fg_mesh, o3d_fg_densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
-                        fg_pcd, depth=poisson_depth) #, width=0, scale=1.1, linear_fit=False)  # depth=10 should be the default value? 11 is good to (but it starts to make a big number of triangles)
+                        fg_pcd, depth=poisson_depth_fg) #, width=0, scale=1.1, linear_fit=False)  # depth=10 should be the default value? 11 is good to (but it starts to make a big number of triangles)
 
                     if vertices_density_quantile > 0.:
                         CONSOLE.print("Removing vertices with low densities...")
@@ -565,7 +775,7 @@ def extract_mesh_from_coarse_sugar(args):
 
                     CONSOLE.print("Now computing mesh...")
                     o3d_bg_mesh, o3d_bg_densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
-                        bg_pcd, depth=poisson_depth) #, width=0, scale=1.1, linear_fit=False)  # depth=10 should be the default value? 11 is good to (but it starts to make a big number of triangles)
+                        bg_pcd, depth=poisson_depth_bg) #, width=0, scale=1.1, linear_fit=False)  # depth=10 should be the default value? 11 is good to (but it starts to make a big number of triangles)
 
                     if vertices_density_quantile > 0.:
                         CONSOLE.print("Removing vertices with low densities...")
@@ -701,6 +911,41 @@ def extract_mesh_from_coarse_sugar(args):
 
                 CONSOLE.print("Foreground points:", fg_points.shape, fg_colors.shape, fg_normals.shape)
                 CONSOLE.print("Background points:", bg_points.shape, bg_colors.shape, bg_normals.shape)
+
+                # ---- [M1+b 自有改动，Frosting 原版没有] ----
+                # 用真正送进 Poisson 的表面采样点（fg_points / bg_points，即 fg_pcd / bg_pcd 的
+                # 来源 tensor）分别估 D_fg / D_bg：随机子采样 <=50 万点，knn_points K=2 取平方
+                # 距离的 10% 分位数，除以各自包围盒尺寸，再套 Frosting 的 D 公式。
+                if use_surface_depth_estimate or only_report_depth:
+                    _d_fg_s, _det_fg_s = compute_poisson_depth_from_points(
+                        fg_points, cell_size_nn_distance_ratio=cell_size_nn_distance_ratio,
+                        max_poisson_depth=max_poisson_depth, tag='fg_surface')
+                    _d_bg_s, _det_bg_s = compute_poisson_depth_from_points(
+                        bg_points, cell_size_nn_distance_ratio=cell_size_nn_distance_ratio,
+                        max_poisson_depth=max_poisson_depth, tag='bg_surface')
+                    CONSOLE.print("[M1+b] Poisson depth (fg, surface):", _d_fg_s, _det_fg_s)
+                    CONSOLE.print("[M1+b] Poisson depth (bg, surface):", _d_bg_s, _det_bg_s)
+                    extract_stats['depth_fg_surface'] = None if _d_fg_s is None else int(_d_fg_s)
+                    extract_stats['depth_fg_surface_details'] = _det_fg_s
+                    extract_stats['depth_bg_surface'] = None if _d_bg_s is None else int(_d_bg_s)
+                    extract_stats['depth_bg_surface_details'] = _det_bg_s
+
+                    if use_surface_depth_estimate:
+                        if use_auto_poisson_depth and _d_fg_s is not None:
+                            poisson_depth_fg = int(_d_fg_s)
+                            if use_same_depth_for_bg:
+                                poisson_depth_bg = int(_d_fg_s)
+                        if use_auto_poisson_depth_bg and _d_bg_s is not None:
+                            poisson_depth_bg = int(_d_bg_s)
+                    extract_stats['poisson_depth_fg_used'] = int(poisson_depth_fg)
+                    extract_stats['poisson_depth_bg_used'] = int(poisson_depth_bg)
+                    extract_stats['poisson_depth_used'] = int(poisson_depth_fg)
+                    with open(os.path.join(mesh_output_dir, 'extract_stats.json'), 'w') as _f:
+                        json.dump(extract_stats, _f, indent=2)
+                    if only_report_depth:
+                        CONSOLE.print("[only_report_depth=True] Depths reported, skipping mesh extraction.")
+                        return []
+                CONSOLE.print("[M1+] Poisson depth used -> fg:", poisson_depth_fg, " bg:", poisson_depth_bg)
                 
                 # ---Compute foreground mesh---
                 CONSOLE.print("\n-----Foreground mesh-----")
@@ -719,7 +964,7 @@ def extract_mesh_from_coarse_sugar(args):
 
                 CONSOLE.print("Now computing mesh...")
                 o3d_fg_mesh, o3d_fg_densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
-                    fg_pcd, depth=poisson_depth) #, width=0, scale=1.1, linear_fit=False)  # depth=10 should be the default value? 11 is good to (but it starts to make a big number of triangles)
+                    fg_pcd, depth=poisson_depth_fg) #, width=0, scale=1.1, linear_fit=False)  # depth=10 should be the default value? 11 is good to (but it starts to make a big number of triangles)
 
                 if vertices_density_quantile > 0.:
                     CONSOLE.print("Removing vertices with low densities...")
@@ -744,7 +989,7 @@ def extract_mesh_from_coarse_sugar(args):
 
                     CONSOLE.print("Now computing mesh...")
                     o3d_bg_mesh, o3d_bg_densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
-                        bg_pcd, depth=poisson_depth) #, width=0, scale=1.1, linear_fit=False)  # depth=10 should be the default value? 11 is good to (but it starts to make a big number of triangles)
+                        bg_pcd, depth=poisson_depth_bg) #, width=0, scale=1.1, linear_fit=False)  # depth=10 should be the default value? 11 is good to (but it starts to make a big number of triangles)
 
                     if vertices_density_quantile > 0.:
                         CONSOLE.print("Removing vertices with low densities...")    

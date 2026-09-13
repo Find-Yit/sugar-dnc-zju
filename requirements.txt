@@ -1,0 +1,27 @@
+# 核心依赖（本考核实测环境：Python 3.10.12，CUDA 12.1 驱动 575，H200/A100 均可）
+# 安装顺序与注意事项见 README_ZH.md；完整冻结版见 requirements_freeze.txt
+# 1) 先装 torch 系列（PyPI 默认即 cu121），不要裸 pip install torch
+torch==2.4.1
+torchaudio==2.4.1
+torchvision==0.19.1
+# 2) pytorch3d 用官方预编译 wheel（不要从 PyPI 装）：
+#    pip install --no-deps https://dl.fbaipublicfiles.com/pytorch3d/packaging/wheels/py310_cu121_pyt241/pytorch3d-0.7.8-cp310-cp310-linux_x86_64.whl
+# 3) 其余依赖：
+fvcore==0.1.5.post20221221
+iopath==0.1.10
+matplotlib==3.10.9
+ninja==1.13.2
+numpy==1.26.4
+open3d==0.19.0
+opencv-python==4.11.0.86
+pandas==2.3.3
+pillow==12.3.0
+plotly==7.0.0
+plyfile==1.1.3
+rich==15.0.0
+scikit-learn==1.7.2
+scipy==1.15.3
+tqdm==4.70.1
+# 4) CUDA 扩展从子模块源码编译（H200 用 TORCH_CUDA_ARCH_LIST=9.0，A100 用 8.0）：
+#    pip install --no-build-isolation --no-deps ./gaussian_splatting/submodules/diff-gaussian-rasterization
+#    pip install --no-build-isolation --no-deps ./gaussian_splatting/submodules/simple-knn
